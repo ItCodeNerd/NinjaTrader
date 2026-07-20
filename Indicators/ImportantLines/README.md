@@ -1,5 +1,7 @@
 # Important Lines indicator
 
+Combined indicator plotting session VWAP, previous-day levels, fixed number lines, and up to 4 configurable EMAs on one chart. Session VWAP tracks Asia/London/NY sessions with custom start/end times (ET, wraps overnight if needed). Previous-day levels mark prior day's high/low/close for reference. Fixed number lines let you pin arbitrary price levels. EMAs (periods, colors, show/hide) fully configurable per line. Aims to replace several separate indicators with one, keeping chart clean.
+
 <img width="1140" height="903" alt="image" src="https://github.com/user-attachments/assets/29b1cb9e-ce54-4721-b0a7-455bbef2b27e" />
 
 <img width="336" height="421" alt="image" src="https://github.com/user-attachments/assets/918e914e-8c70-4248-ba4e-7db00d3351e5" />
