@@ -9,6 +9,7 @@ using System.Xml.Serialization;
 using NinjaTrader.Data;
 using NinjaTrader.Gui;
 using NinjaTrader.Gui.Chart;
+using NinjaTrader.NinjaScript.Indicators.ItCodeNerd;
 using SharpDX;
 using SharpDX.Direct2D1;
 using SharpDX.DirectWrite;
@@ -22,6 +23,14 @@ using TextFormat = SharpDX.DirectWrite.TextFormat;
 // This namespace holds indicators in this folder and is required. Do not change it.
 namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 {
+	public enum PanelCorner
+	{
+		TopLeft,
+		TopRight,
+		BottomLeft,
+		BottomRight
+	}
+
 	/// <summary>
 	/// Draws a fixed on-screen panel showing the last N 5-minute, 15-minute and 1-hour
 	/// candles, completely independent of the timeframe the chart itself is set to.
@@ -57,7 +66,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		{
 			if (State == State.SetDefaults)
 			{
-				Description = "Fixed panel showing the last N 5m / 15m / 1H candles regardless of chart timeframe.";
+				Description = "Fixed panel showing the last N 5m / 15m / 1H candles regardless of chart timeframe, plus optional S/R lines.";
 				Name = "ICNCandlePanel";
 				Calculate = Calculate.OnEachTick;
 				IsOverlay = true;
@@ -75,8 +84,11 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				SRLookbackBars = 40;
 				PanelWidth = 230;
 				PanelHeight = 260;
+				PanelCorner = PanelCorner.TopRight;
 				PanelMarginRight = 15;
+				PanelMarginLeft = 15;
 				PanelMarginTop = 60;
+				PanelMarginBottom = 15;
 
 				UpBrush = System.Windows.Media.Brushes.SeaGreen;
 				DownBrush = System.Windows.Media.Brushes.IndianRed;
@@ -161,21 +173,11 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				return;
 
 			// ---------- gather candle data from the three fixed series ----------
-			// 1H is the anchor; 5m/15m are filtered to the same time window so highs/lows line up.
+			// Each series always shows its own last N bars relative to the current bar,
+			// regardless of hour boundaries.
 			var c1h = CollectCandles(3, Candles1h);
-			List<Candle> c5, c15;
-			if (c1h.Count > 0)
-			{
-				DateTime windowEnd = c1h[c1h.Count - 1].Time;
-				DateTime windowStart = c1h[0].Time.AddHours(-1);
-				c5 = CollectCandlesInWindow(1, Candles5m, windowStart, windowEnd);
-				c15 = CollectCandlesInWindow(2, Candles15m, windowStart, windowEnd);
-			}
-			else
-			{
-				c5 = CollectCandles(1, Candles5m);
-				c15 = CollectCandles(2, Candles15m);
-			}
+			var c5 = CollectCandles(1, Candles5m);
+			var c15 = CollectCandles(2, Candles15m);
 
 			// ---------- optional support / resistance lines (based on chart series) ----------
 			if (ShowSRLines && CurrentBar >= SRLookbackBars)
@@ -203,27 +205,29 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				return;
 
 			// ---------- panel background ----------
-			float panelX = ChartPanel.X + ChartPanel.W - PanelMarginRight - PanelWidth;
-			float panelY = ChartPanel.Y + PanelMarginTop;
+			float panelX = PanelCorner == PanelCorner.TopLeft || PanelCorner == PanelCorner.BottomLeft
+				? ChartPanel.X + PanelMarginLeft
+				: ChartPanel.X + ChartPanel.W - PanelMarginRight - PanelWidth;
+			float panelY = PanelCorner == PanelCorner.TopLeft || PanelCorner == PanelCorner.TopRight
+				? ChartPanel.Y + PanelMarginTop
+				: ChartPanel.Y + ChartPanel.H - PanelMarginBottom - PanelHeight;
 			var panelRect = new RectangleF(panelX, panelY, PanelWidth, PanelHeight);
 
 			RenderTarget.FillRectangle(panelRect, bgBrush);
 			RenderTarget.DrawRectangle(panelRect, borderBrush, 1f);
-
-			// ---------- compute shared price scale across all displayed candles ----------
-			var all = new List<Candle>();
-			all.AddRange(c5); all.AddRange(c15); all.AddRange(c1h);
-			double maxHigh = all.Max(c => c.High);
-			double minLow = all.Min(c => c.Low);
-			if (maxHigh <= minLow)
-				maxHigh = minLow + 1; // avoid divide-by-zero on flat data
 
 			const float topPad = 18f;    // room for the "5m/15m/1H" label row
 			const float bottomPad = 8f;
 			float candleAreaTop = panelY + topPad;
 			float candleAreaHeight = PanelHeight - topPad - bottomPad;
 
-			int totalCandles = Math.Max(1, Candles5m + Candles15m + Candles1h);
+			// 1H group is sized to match the 15m group's width (same slot count) rather than
+			// its own (usually much smaller) candle count.
+			int slots5m = Candles5m;
+			int slots15m = Candles15m;
+			int slots1h = Math.Max(Candles1h, Candles15m);
+
+			int totalCandles = Math.Max(1, slots5m + slots15m + slots1h);
 			int groupCount = new[] { c5.Count > 0, c15.Count > 0, c1h.Count > 0 }.Count(b => b);
 			float innerPad = 10f;
 			const float groupGap = 18f; // gap between timeframe groups (room for outline boxes)
@@ -232,11 +236,18 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			float pitch = Math.Min(maxPitch, (PanelWidth - innerPad * 2 - gapsWidth) / totalCandles);
 			float xCursor = panelX + innerPad;
 
-			xCursor = DrawGroup(c5, "5m", xCursor, pitch, candleAreaTop, candleAreaHeight, minLow, maxHigh, groupGap);
-			xCursor = DrawGroup(c15, "15m", xCursor, pitch, candleAreaTop, candleAreaHeight, minLow, maxHigh, groupGap);
-			xCursor = DrawGroup(c1h, "1H", xCursor, pitch, candleAreaTop, candleAreaHeight, minLow, maxHigh, groupGap);
+			xCursor = DrawGroup(c5, "5m", xCursor, pitch, slots5m, candleAreaTop, candleAreaHeight, groupGap);
+			xCursor = DrawGroup(c15, "15m", xCursor, pitch, slots15m, candleAreaTop, candleAreaHeight, groupGap);
+			xCursor = DrawGroup(c1h, "1H", xCursor, pitch, slots1h, candleAreaTop, candleAreaHeight, groupGap);
 
 			// ---------- current price line across all panel groups ----------
+			var all = new List<Candle>();
+			all.AddRange(c5); all.AddRange(c15); all.AddRange(c1h);
+			double maxHigh = all.Max(c => c.High);
+			double minLow = all.Min(c => c.Low);
+			if (maxHigh <= minLow)
+				maxHigh = minLow + 1; // avoid divide-by-zero on flat data
+
 			try
 			{
 				double currentPrice = Close[0];
@@ -275,15 +286,28 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		/// <summary>
 		/// Draws one timeframe group (e.g. the 4 five-minute candles), candles packed tightly
 		/// together, and returns the x position where the next group (after its gap) should start.
+		/// The group's box always spans <paramref name="slots"/> pitches wide (so e.g. the 1H
+		/// group can be forced to match the 15m group's width even with fewer candles), and the
+		/// candles it contains are spread evenly across that width.
 		/// </summary>
-		private float DrawGroup(List<Candle> candles, string label, float xStart, float pitch,
-			float areaTop, float areaHeight, double minLow, double maxHigh, float groupGap)
+		private float DrawGroup(List<Candle> candles, string label, float xStart, float pitch, int slots,
+			float areaTop, float areaHeight, float groupGap)
 		{
 			if (candles.Count == 0)
 				return xStart; // nothing drawn, no gap to add
 
+			// Each group is scaled to its own high/low range so all groups fill the same box
+			// height regardless of how much the underlying timeframe actually moved.
+			double maxHigh = candles.Max(c => c.High);
+			double minLow = candles.Min(c => c.Low);
+			if (maxHigh <= minLow)
+				maxHigh = minLow + 1; // avoid divide-by-zero on flat data
+
+			slots = Math.Max(slots, candles.Count);
+			float groupWidth = pitch * slots;
+			float candlePitch = groupWidth / candles.Count;
+
 			// group label centered above this group's slots
-			float groupWidth = pitch * candles.Count;
 			var labelRect = new RectangleF(xStart, areaTop - 16f, groupWidth, 14f);
 			RenderTarget.DrawText(label, labelFormat, labelRect, textBrush);
 
@@ -295,8 +319,8 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			float x = xStart;
 			foreach (var candle in candles)
 			{
-				float bodyWidth = pitch * 0.7f;
-				float xCenter = x + pitch * 0.5f;
+				float bodyWidth = Math.Min(pitch, candlePitch) * 0.7f;
+				float xCenter = x + candlePitch * 0.5f;
 
 				float yOpen = PriceToY(candle.Open, minLow, maxHigh, areaTop, areaHeight);
 				float yClose = PriceToY(candle.Close, minLow, maxHigh, areaTop, areaHeight);
@@ -318,10 +342,10 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				var bodyRect = new RectangleF(xCenter - bodyWidth * 0.5f, bodyTop, bodyWidth, bodyBottom - bodyTop);
 				RenderTarget.FillRectangle(bodyRect, bodyBrush);
 
-				x += pitch;
+				x += candlePitch;
 			}
 
-			return x + groupGap;
+			return xStart + groupWidth + groupGap;
 		}
 
 		private static float PriceToY(double price, double minLow, double maxHigh, float areaTop, float areaHeight)
@@ -365,23 +389,6 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			return list;
 		}
 
-		/// <summary>
-		/// Same as <see cref="CollectCandles"/>, but restricted to bars whose close time
-		/// falls within (windowStart, windowEnd] so groups line up with the 1H candle(s) shown.
-		/// </summary>
-		private List<Candle> CollectCandlesInWindow(int seriesIndex, int count, DateTime windowStart, DateTime windowEnd)
-		{
-			if (count <= 0)
-				return new List<Candle>();
-
-			int bufferCount = Math.Max(count * 6, 30); // generous buffer to filter down from
-			var buffer = CollectCandles(seriesIndex, bufferCount);
-			var filtered = buffer.Where(c => c.Time > windowStart && c.Time <= windowEnd).ToList();
-			if (filtered.Count > count)
-				filtered = filtered.Skip(filtered.Count - count).ToList();
-			return filtered;
-		}
-
 		#region Properties
 
 		[NinjaScriptProperty]
@@ -419,14 +426,28 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		public float PanelHeight { get; set; }
 
 		[NinjaScriptProperty]
+		[Display(Name = "Panel corner", GroupName = "Panel Layout", Order = 3)]
+		public PanelCorner PanelCorner { get; set; }
+
+		[NinjaScriptProperty]
 		[Range(0, 400)]
-		[Display(Name = "Panel margin from right (px)", GroupName = "Panel Layout", Order = 3)]
+		[Display(Name = "Panel margin from right (px)", GroupName = "Panel Layout", Order = 4)]
 		public float PanelMarginRight { get; set; }
 
 		[NinjaScriptProperty]
 		[Range(0, 400)]
-		[Display(Name = "Panel margin from top (px)", GroupName = "Panel Layout", Order = 4)]
+		[Display(Name = "Panel margin from left (px)", GroupName = "Panel Layout", Order = 5)]
+		public float PanelMarginLeft { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 400)]
+		[Display(Name = "Panel margin from top (px)", GroupName = "Panel Layout", Order = 6)]
 		public float PanelMarginTop { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 400)]
+		[Display(Name = "Panel margin from bottom (px)", GroupName = "Panel Layout", Order = 7)]
+		public float PanelMarginBottom { get; set; }
 
 		[XmlIgnore]
 		[Display(Name = "Up candle color", GroupName = "Colors", Order = 1)]
@@ -505,60 +526,3 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		#endregion
 	}
 }
-
-#region NinjaScript generated code. Neither change nor remove.
-
-namespace NinjaTrader.NinjaScript.Indicators
-{
-	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
-	{
-		private ItCodeNerd.ICNCandlePanel[] cacheICNCandlePanel;
-		public ItCodeNerd.ICNCandlePanel ICNCandlePanel(int candles5m, int candles15m, int candles1h, bool showSRLines, int sRLookbackBars, float panelWidth, float panelHeight, float panelMarginRight, float panelMarginTop, bool showCurrentPriceLine)
-		{
-			return ICNCandlePanel(Input, candles5m, candles15m, candles1h, showSRLines, sRLookbackBars, panelWidth, panelHeight, panelMarginRight, panelMarginTop, showCurrentPriceLine);
-		}
-
-		public ItCodeNerd.ICNCandlePanel ICNCandlePanel(ISeries<double> input, int candles5m, int candles15m, int candles1h, bool showSRLines, int sRLookbackBars, float panelWidth, float panelHeight, float panelMarginRight, float panelMarginTop, bool showCurrentPriceLine)
-		{
-			if (cacheICNCandlePanel != null)
-				for (int idx = 0; idx < cacheICNCandlePanel.Length; idx++)
-					if (cacheICNCandlePanel[idx] != null && cacheICNCandlePanel[idx].Candles5m == candles5m && cacheICNCandlePanel[idx].Candles15m == candles15m && cacheICNCandlePanel[idx].Candles1h == candles1h && cacheICNCandlePanel[idx].ShowSRLines == showSRLines && cacheICNCandlePanel[idx].SRLookbackBars == sRLookbackBars && cacheICNCandlePanel[idx].PanelWidth == panelWidth && cacheICNCandlePanel[idx].PanelHeight == panelHeight && cacheICNCandlePanel[idx].PanelMarginRight == panelMarginRight && cacheICNCandlePanel[idx].PanelMarginTop == panelMarginTop && cacheICNCandlePanel[idx].ShowCurrentPriceLine == showCurrentPriceLine && cacheICNCandlePanel[idx].EqualsInput(input))
-						return cacheICNCandlePanel[idx];
-			return CacheIndicator<ItCodeNerd.ICNCandlePanel>(new ItCodeNerd.ICNCandlePanel(){ Candles5m = candles5m, Candles15m = candles15m, Candles1h = candles1h, ShowSRLines = showSRLines, SRLookbackBars = sRLookbackBars, PanelWidth = panelWidth, PanelHeight = panelHeight, PanelMarginRight = panelMarginRight, PanelMarginTop = panelMarginTop, ShowCurrentPriceLine = showCurrentPriceLine }, input, ref cacheICNCandlePanel);
-		}
-	}
-}
-
-namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
-{
-	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
-	{
-		public Indicators.ItCodeNerd.ICNCandlePanel ICNCandlePanel(int candles5m, int candles15m, int candles1h, bool showSRLines, int sRLookbackBars, float panelWidth, float panelHeight, float panelMarginRight, float panelMarginTop, bool showCurrentPriceLine)
-		{
-			return indicator.ICNCandlePanel(Input, candles5m, candles15m, candles1h, showSRLines, sRLookbackBars, panelWidth, panelHeight, panelMarginRight, panelMarginTop, showCurrentPriceLine);
-		}
-
-		public Indicators.ItCodeNerd.ICNCandlePanel ICNCandlePanel(ISeries<double> input , int candles5m, int candles15m, int candles1h, bool showSRLines, int sRLookbackBars, float panelWidth, float panelHeight, float panelMarginRight, float panelMarginTop, bool showCurrentPriceLine)
-		{
-			return indicator.ICNCandlePanel(input, candles5m, candles15m, candles1h, showSRLines, sRLookbackBars, panelWidth, panelHeight, panelMarginRight, panelMarginTop, showCurrentPriceLine);
-		}
-	}
-}
-
-namespace NinjaTrader.NinjaScript.Strategies
-{
-	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
-	{
-		public Indicators.ItCodeNerd.ICNCandlePanel ICNCandlePanel(int candles5m, int candles15m, int candles1h, bool showSRLines, int sRLookbackBars, float panelWidth, float panelHeight, float panelMarginRight, float panelMarginTop, bool showCurrentPriceLine)
-		{
-			return indicator.ICNCandlePanel(Input, candles5m, candles15m, candles1h, showSRLines, sRLookbackBars, panelWidth, panelHeight, panelMarginRight, panelMarginTop, showCurrentPriceLine);
-		}
-
-		public Indicators.ItCodeNerd.ICNCandlePanel ICNCandlePanel(ISeries<double> input , int candles5m, int candles15m, int candles1h, bool showSRLines, int sRLookbackBars, float panelWidth, float panelHeight, float panelMarginRight, float panelMarginTop, bool showCurrentPriceLine)
-		{
-			return indicator.ICNCandlePanel(input, candles5m, candles15m, candles1h, showSRLines, sRLookbackBars, panelWidth, panelHeight, panelMarginRight, panelMarginTop, showCurrentPriceLine);
-		}
-	}
-}
-
-#endregion
