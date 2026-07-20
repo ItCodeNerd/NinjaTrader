@@ -1,4 +1,4 @@
-# NinjaTrader
+# Delta Footprint indicator
 
 <img width="907" height="925" alt="image" src="https://github.com/user-attachments/assets/580dd3f2-4da0-4fcf-b463-17fd8ed6d464" />
 
