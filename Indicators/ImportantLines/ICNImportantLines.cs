@@ -66,6 +66,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		private SharpDX.Direct2D1.Brush _dxEuropeHighLineBrush, _dxEuropeLowLineBrush;
 		private SharpDX.Direct2D1.Brush _dxGlobexOpenBrush;
 		private SharpDX.Direct2D1.Brush _dxMidnightOpenBrush;
+		private SharpDX.Direct2D1.Brush _dxNyOpenPriceBrush;
 		private SharpDX.Direct2D1.Brush _dxPwhBrush, _dxPwlBrush;
 		private double _asiaSessionHigh, _asiaSessionLow;
 		private bool _asiaSessionStarted;
@@ -151,6 +152,9 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		private DateTime _lastMidnightNYDate;
 		private DateTime _lastGlobexOpenNYDate;     // NY date for which the 1-min series captured the Globex open
 		private DateTime _lastMidnightMinuteNYDate; // NY date for which the 1-min series captured the midnight open
+		private double _nyOpenPrice; // open price of today's NY session (NYStartTime bar, default 09:30 ET)
+		private DateTime _nyOpenStart;
+		private DateTime _lastNyOpenMinuteNYDate;   // NY date for which the 1-min series captured the NY open
 
 		// Track the last NY date we saw an 18:00 bar to detect session roll
 		private DateTime _lastSessionRollNYDate;
@@ -196,6 +200,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		private NTMenuItem ntTDH, ntTDL, ntTPVAH, ntTPVAL, ntPOC;
 		private NTMenuItem ntGlobexOpen;
 		private NTMenuItem ntMidnightOpen;
+		private NTMenuItem ntNYOpenPrice;
 		private NTMenuItem ntTodayPDH, ntTodayPDL;
 		private NTMenuItem ntDayOpenLine, ntAsiaOpenLine, ntLondonOpenLine, ntNYOpenLine;
 		private bool _showAllPDL;
@@ -276,6 +281,10 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				// ── Midnight Open defaults ──
 				ShowMidnightOpen = true; MidnightOpenBrush = Brushes.White;
 				MidnightLineWidth = 2; MidnightDashStyle = DashStyleHelper.Dash;
+
+				// ── NY Open Price defaults ──
+				ShowNYOpenPrice = true; NYOpenPriceBrush = Brushes.Cyan;
+				NYOpenPriceLineWidth = 2; NYOpenPriceDashStyle = DashStyleHelper.Dash;
 
 				// ── Session Open vertical line defaults ──
 				ShowDayOpenLine = true; DayOpenLineBrush = Brushes.White;
@@ -421,6 +430,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				_lastMidnightNYDate = DateTime.MinValue;
 				_lastGlobexOpenNYDate = DateTime.MinValue;
 				_lastMidnightMinuteNYDate = DateTime.MinValue;
+				_lastNyOpenMinuteNYDate = DateTime.MinValue;
 				_ib.Reset();
 
 				// Cache TimeZoneInfo to avoid expensive FindSystemTimeZoneById on every bar
@@ -502,6 +512,14 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				{
 					_lastMidnightMinuteNYDate = nyMin.Date;
 					_midnightOpenPrice = Open[0];
+				}
+
+				// NY open: first minute bar ending after the configured NY start time
+				// (default 09:30 ET) covers the true first trade of the NY session.
+				if (nyMin.TimeOfDay > _tsNYStart && nyMin.Date != _lastNyOpenMinuteNYDate)
+				{
+					_lastNyOpenMinuteNYDate = nyMin.Date;
+					_nyOpenPrice = Open[0];
 				}
 				return;
 			}
@@ -686,7 +704,14 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				}
 				PlotVWAPNY[0] = _cumTypicalVolumeNY / _cumVolumeNY;
 				_lastVwapNY = PlotVWAPNY[0];
-				if (!_nySessionStarted) { _nySessionStarted = true; _nySessionStart = Time[0]; _nySessionEnd = DateTime.MinValue; _nyOpenTimes.Add(Time[0]); }
+				if (!_nySessionStarted)
+				{
+					_nySessionStarted = true; _nySessionStart = Time[0]; _nySessionEnd = DateTime.MinValue; _nyOpenTimes.Add(Time[0]);
+					_nyOpenStart = Time[0];
+					// Fallback only — the 1-min series capture is authoritative
+					if (_lastNyOpenMinuteNYDate != nyTime.Date)
+						_nyOpenPrice = Open[0];
+				}
 			}
 			else { _cumVolumeNY = 0; _cumTypicalVolumeNY = 0; if (_nySessionStarted && _nySessionEnd == DateTime.MinValue) _nySessionEnd = Time[0]; }
 
@@ -901,6 +926,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				_dxEuropeLowLineBrush = EuropeLowBrush.ToDxBrush(RenderTarget);
 				_dxGlobexOpenBrush = GlobexOpenBrush.ToDxBrush(RenderTarget);
 				_dxMidnightOpenBrush = MidnightOpenBrush.ToDxBrush(RenderTarget);
+				_dxNyOpenPriceBrush = NYOpenPriceBrush.ToDxBrush(RenderTarget);
 				_dxDayOpenLineBrush = DayOpenLineBrush.ToDxBrush(RenderTarget);
 				_dxAsiaOpenLineBrush = AsiaOpenLineBrush.ToDxBrush(RenderTarget);
 				_dxLondonOpenLineBrush = LondonOpenLineBrush.ToDxBrush(RenderTarget);
@@ -948,6 +974,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			if (_dxEuropeLowLineBrush != null) { _dxEuropeLowLineBrush.Dispose(); _dxEuropeLowLineBrush = null; }
 			if (_dxGlobexOpenBrush != null) { _dxGlobexOpenBrush.Dispose(); _dxGlobexOpenBrush = null; }
 			if (_dxMidnightOpenBrush != null) { _dxMidnightOpenBrush.Dispose(); _dxMidnightOpenBrush = null; }
+			if (_dxNyOpenPriceBrush != null) { _dxNyOpenPriceBrush.Dispose(); _dxNyOpenPriceBrush = null; }
 			if (_dxDayOpenLineBrush != null) { _dxDayOpenLineBrush.Dispose(); _dxDayOpenLineBrush = null; }
 			if (_dxAsiaOpenLineBrush != null) { _dxAsiaOpenLineBrush.Dispose(); _dxAsiaOpenLineBrush = null; }
 			if (_dxLondonOpenLineBrush != null) { _dxLondonOpenLineBrush.Dispose(); _dxLondonOpenLineBrush = null; }
@@ -1152,6 +1179,19 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 					DrawSharpDXLine(xm0, xm1, chartScale.GetYByValue(_midnightOpenPrice), _dxMidnightOpenBrush, MidnightLineWidth, MidnightDashStyle);
 					if (ShowLineLabels && _textFormat != null)
 						RenderLabelAt("Midnight Open " + _midnightOpenPrice.ToString("F2"), _midnightOpenPrice, xm1 - 5f, labelH, chartScale, _dxMidnightOpenBrush);
+				}
+			}
+
+			// ── NY Open (09:30 ET by default — follows NYStartTime) ────────────
+			if (ShowNYOpenPrice && _nyOpenPrice > 0 && _dxNyOpenPriceBrush != null && _nyOpenStart != DateTime.MinValue)
+			{
+				float xn0 = Math.Max(GetXForTime(chartControl, _nyOpenStart) - chartControl.GetBarPaintWidth(ChartBars) / 2f, canvasLeft);
+				float xn1 = canvasRight;
+				if (xn1 > xn0)
+				{
+					DrawSharpDXLine(xn0, xn1, chartScale.GetYByValue(_nyOpenPrice), _dxNyOpenPriceBrush, NYOpenPriceLineWidth, NYOpenPriceDashStyle);
+					if (ShowLineLabels && _textFormat != null)
+						RenderLabelAt("NY Open " + _nyOpenPrice.ToString("F2"), _nyOpenPrice, xn1 - 5f, labelH, chartScale, _dxNyOpenPriceBrush);
 				}
 			}
 
@@ -1763,7 +1803,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 								   ShowDayHighVWAP && ShowDayLowVWAP && ShowWeeklyVWAP && ShowVwap24h &&
 								   ShowPDVwapNY && ShowPDVwapSession && ShowVwapBands;
 				_showAllHistoric = ShowHistoricLines && ShowPDH && ShowPDL && ShowPVAH && ShowPVAL && ShowPrevPOC;
-				_showAllToday = ShowTDH && ShowTDL && ShowTPVAH && ShowTPVAL && ShowPOC && ShowGlobexOpen && ShowMidnightOpen;
+				_showAllToday = ShowTDH && ShowTDL && ShowTPVAH && ShowTPVAL && ShowPOC && ShowGlobexOpen && ShowMidnightOpen && ShowNYOpenPrice;
 				_showAllPDL = _showAllHistoric && _showAllToday;
 				_showAllFixed = ShowFixedLines;
 				bool _showAllORBInit = ShowORB && ShowAsiaORB && ShowEuropeORB && ShowIB && ShowIBExtensions;
@@ -1846,7 +1886,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				ntBartopMenuItem.Items.Add(ntWeekMenu);
 
 				_showAllHistoric = ShowHistoricLines && ShowPDH && ShowPDL && ShowPVAH && ShowPVAL && ShowPrevPOC;
-				_showAllToday = ShowTDH && ShowTDL && ShowTPVAH && ShowTPVAL && ShowPOC && ShowGlobexOpen && ShowMidnightOpen;
+				_showAllToday = ShowTDH && ShowTDL && ShowTPVAH && ShowTPVAL && ShowPOC && ShowGlobexOpen && ShowMidnightOpen && ShowNYOpenPrice;
 				_showAllPDL = _showAllHistoric && _showAllToday;
 
 				// ── Historic submenu ──────────────────────────────────────
@@ -1886,6 +1926,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				ntPOC = MakeColoredItem(ShowPOC ? "Hide Point of Control" : "Show Point of Control", PocBrush as System.Windows.Media.Brush ?? Brushes.White); ntPOC.Tag = "ShowPOC";
 				ntGlobexOpen = MakeColoredItem(ShowGlobexOpen ? "Hide Globex Open" : "Show Globex Open", GlobexOpenBrush as System.Windows.Media.Brush ?? Brushes.Yellow); ntGlobexOpen.Tag = "ShowGlobexOpen";
 				ntMidnightOpen = MakeColoredItem(ShowMidnightOpen ? "Hide Midnight Open" : "Show Midnight Open", MidnightOpenBrush as System.Windows.Media.Brush ?? Brushes.White); ntMidnightOpen.Tag = "ShowMidnightOpen";
+			ntNYOpenPrice = MakeColoredItem(ShowNYOpenPrice ? "Hide NY Open Price" : "Show NY Open Price", NYOpenPriceBrush as System.Windows.Media.Brush ?? Brushes.Cyan); ntNYOpenPrice.Tag = "ShowNYOpenPrice";
 				ntTodayPDH = MakeColoredItem(ShowPDH ? "Hide Prev Day High" : "Show Prev Day High", PdhBrush as System.Windows.Media.Brush ?? Brushes.DodgerBlue); ntTodayPDH.Tag = "ShowPDH";
 				ntTodayPDL = MakeColoredItem(ShowPDL ? "Hide Prev Day Low" : "Show Prev Day Low", PdlBrush as System.Windows.Media.Brush ?? Brushes.DodgerBlue); ntTodayPDL.Tag = "ShowPDL";
 				ntDayOpenLine = MakeColoredItem(ShowDayOpenLine ? "Hide Day Open Line" : "Show Day Open Line", DayOpenLineBrush as System.Windows.Media.Brush ?? Brushes.White); ntDayOpenLine.Tag = "ShowDayOpenLine";
@@ -1899,6 +1940,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				ntPOC.Click += NTBarMenu_Click;
 				ntGlobexOpen.Click += NTBarMenu_Click;
 				ntMidnightOpen.Click += NTBarMenu_Click;
+			ntNYOpenPrice.Click += NTBarMenu_Click;
 				ntTodayPDH.Click += NTBarMenu_Click;
 				ntTodayPDL.Click += NTBarMenu_Click;
 				ntDayOpenLine.Click += NTBarMenu_Click;
@@ -1915,6 +1957,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				ntTodayMenu.Items.Add(ntPOC);
 				ntTodayMenu.Items.Add(ntGlobexOpen);
 				ntTodayMenu.Items.Add(ntMidnightOpen);
+			ntTodayMenu.Items.Add(ntNYOpenPrice);
 				ntTodayMenu.Items.Add(ntDayOpenLine);
 				ntBartopMenuItem.Items.Add(ntTodayMenu);
 				ntBartopMenuItem.Items.Add(new Separator());
@@ -1997,7 +2040,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 						ShowDayHighVWAP = ShowDayLowVWAP = ShowWeeklyVWAP = ShowPDVwapNY = ShowPDVwapSession = ShowVwapBands = ShowVwap24h = _showAll;
 						// Prev Day Levels
 						ShowHistoricLines = ShowPDH = ShowPDL = ShowPVAH = ShowPVAL = ShowPrevPOC = _showAll;
-						ShowTDH = ShowTDL = ShowTPVAH = ShowTPVAL = ShowPOC = ShowGlobexOpen = ShowMidnightOpen = _showAll;
+						ShowTDH = ShowTDL = ShowTPVAH = ShowTPVAL = ShowPOC = ShowGlobexOpen = ShowMidnightOpen = ShowNYOpenPrice = _showAll;
 						ShowTodayVABackground = _showAll;
 						// Week
 						ShowPrevWeekHigh = ShowPrevWeekLow = _showAll;
@@ -2041,7 +2084,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 					case "ShowAllPDL":
 						_showAllPDL = !_showAllPDL;
 						ShowHistoricLines = ShowPDH = ShowPDL = ShowPVAH = ShowPVAL = ShowPrevPOC = _showAllPDL;
-						ShowTDH = ShowTDL = ShowTPVAH = ShowTPVAL = ShowPOC = ShowGlobexOpen = ShowMidnightOpen = _showAllPDL;
+						ShowTDH = ShowTDL = ShowTPVAH = ShowTPVAL = ShowPOC = ShowGlobexOpen = ShowMidnightOpen = ShowNYOpenPrice = _showAllPDL;
 						break;
 					case "ShowAllHistoric":
 						_showAllHistoric = !_showAllHistoric;
@@ -2049,7 +2092,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 						break;
 					case "ShowAllToday":
 						_showAllToday = !_showAllToday;
-						ShowTDH = ShowTDL = ShowTPVAH = ShowTPVAL = ShowPOC = ShowGlobexOpen = ShowMidnightOpen = _showAllToday;
+						ShowTDH = ShowTDL = ShowTPVAH = ShowTPVAL = ShowPOC = ShowGlobexOpen = ShowMidnightOpen = ShowNYOpenPrice = _showAllToday;
 						break;
 					case "ShowHistoricLines": ShowHistoricLines = !ShowHistoricLines; break;
 					case "ShowTodayVABackground": ShowTodayVABackground = !ShowTodayVABackground; break;
@@ -2065,6 +2108,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 					case "ShowPOC": ShowPOC = !ShowPOC; break;
 					case "ShowGlobexOpen": ShowGlobexOpen = !ShowGlobexOpen; break;
 					case "ShowMidnightOpen": ShowMidnightOpen = !ShowMidnightOpen; break;
+				case "ShowNYOpenPrice": ShowNYOpenPrice = !ShowNYOpenPrice; break;
 					case "ShowDayOpenLine": ShowDayOpenLine = !ShowDayOpenLine; break;
 					case "ShowAsiaOpenLine": ShowAsiaOpenLine = !ShowAsiaOpenLine; break;
 					case "ShowLondonOpenLine": ShowLondonOpenLine = !ShowLondonOpenLine; break;
@@ -2091,7 +2135,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 									   ShowNYVWAP && ShowDayHighVWAP && ShowDayLowVWAP && ShowWeeklyVWAP &&
 									   ShowPDVwapNY && ShowPDVwapSession && ShowVwapBands && ShowVwap24h;
 					_showAllHistoric = ShowHistoricLines && ShowPDH && ShowPDL && ShowPVAH && ShowPVAL && ShowPrevPOC;
-					_showAllToday = ShowTDH && ShowTDL && ShowTPVAH && ShowTPVAL && ShowPOC && ShowGlobexOpen && ShowMidnightOpen;
+					_showAllToday = ShowTDH && ShowTDL && ShowTPVAH && ShowTPVAL && ShowPOC && ShowGlobexOpen && ShowMidnightOpen && ShowNYOpenPrice;
 					_showAllPDL = _showAllHistoric && _showAllToday;
 					bool _showAllORB = ShowORB && ShowAsiaORB && ShowEuropeORB && ShowIB && ShowIBExtensions;
 					_showAllEMA = ShowEma1 && ShowEma2 && ShowEma3 && ShowEma4;
@@ -2145,6 +2189,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 					ntPOC.Header = ShowPOC ? "Hide Point of Control" : "Show Point of Control";
 					ntGlobexOpen.Header = ShowGlobexOpen ? "Hide Globex Open" : "Show Globex Open";
 					ntMidnightOpen.Header = ShowMidnightOpen ? "Hide Midnight Open" : "Show Midnight Open";
+				ntNYOpenPrice.Header = ShowNYOpenPrice ? "Hide NY Open Price" : "Show NY Open Price";
 					ntDayOpenLine.Header = ShowDayOpenLine ? "Hide Day Open Line" : "Show Day Open Line";
 					ntAsiaOpenLine.Header = ShowAsiaOpenLine ? "Hide Asia Open Line" : "Show Asia Open Line";
 					ntLondonOpenLine.Header = ShowLondonOpenLine ? "Hide London Open Line" : "Show London Open Line";
@@ -2794,6 +2839,26 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		[NinjaScriptProperty]
 		[Display(Name = "Midnight Open Dash Style", Description = "Dash style for the midnight open line.", Order = 3, GroupName = "6e. Midnight Open")]
 		public DashStyleHelper MidnightDashStyle { get; set; }
+		#endregion
+
+		#region NY Open Price
+		[NinjaScriptProperty]
+		[Display(Name = "Show NY Open Price", Description = "Draw a horizontal line at the open price of the NY session (follows NY Start Time, default 09:30 ET).", Order = 0, GroupName = "6f. NY Open Price")]
+		public bool ShowNYOpenPrice { get; set; }
+
+		[NinjaScriptProperty]
+		[XmlIgnore]
+		[Display(Name = "NY Open Price Color", Description = "Color of the NY open price line.", Order = 1, GroupName = "6f. NY Open Price")]
+		public Brush NYOpenPriceBrush { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, 10)]
+		[Display(Name = "NY Open Price Line Width", Description = "Pixel width of the NY open price line.", Order = 2, GroupName = "6f. NY Open Price")]
+		public int NYOpenPriceLineWidth { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "NY Open Price Dash Style", Description = "Dash style for the NY open price line.", Order = 3, GroupName = "6f. NY Open Price")]
+		public DashStyleHelper NYOpenPriceDashStyle { get; set; }
 		#endregion
 
 		#region Session Open Lines
