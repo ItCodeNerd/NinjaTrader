@@ -2,6 +2,23 @@
 
 Combined indicator plotting session VWAP, previous-day levels, fixed number lines, and up to 4 configurable EMAs on one chart. Session VWAP tracks Asia/London/NY sessions with custom start/end times (ET, wraps overnight if needed). Previous-day levels mark prior day's high/low/close for reference. Fixed number lines let you pin arbitrary price levels. EMAs (periods, colors, show/hide) fully configurable per line. Aims to replace several separate indicators with one, keeping chart clean.
 
+## Lines available
+
+- **EMA Levels** — up to 4 EMAs, each with own period, color, show/hide toggle.
+- **VWAP** — multiple VWAP variants: full session, Asia/Europe/NY sessions, day-high/day-low anchored, weekly, rolling 24h, and previous-day NY/Session endpoints (dashed reference). Optional ±1/±2 standard-deviation bands. Session times configurable (ET, wraps overnight).
+- **Previous Week** — prior week high/low/close levels.
+- **Prev Day – Value Area** — POC/value-area high-low from prior session. Value area method selectable (VolumeProfile, Uniform, LinearWeighted, CloseWeighted, TPO), value-area % (default 70), and bucket size in ticks.
+- **Prev Day – Previous Day** — Previous Day High/Low (PDH/PDL) and Previous Value Area High/Low (PVAH/PVAL), color and line width per line.
+- **Prev Day – Today** — today's running equivalents of the above levels, updated live.
+- **Prev Day – Visibility** — per-line show/hide toggles for all previous-day levels.
+- **Initial Balance** — first-hour (configurable) high/low range lines.
+- **Opening Range** — configurable opening-range high/low lines with own timing.
+- **Session High/Low** — running high/low of current session.
+- **Globex Open** — Globex session open price line.
+- **Midnight Open** — midnight open price line.
+- **Session Open Lines** — session open price markers.
+- **Fixed Lines** — manually pinned price levels, not tied to any session or calculation.
+
 <img width="1140" height="903" alt="image" src="https://github.com/user-attachments/assets/29b1cb9e-ce54-4721-b0a7-455bbef2b27e" />
 
 <img width="336" height="421" alt="image" src="https://github.com/user-attachments/assets/918e914e-8c70-4248-ba4e-7db00d3351e5" />
