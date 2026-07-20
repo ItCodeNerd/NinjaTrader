@@ -1,4 +1,4 @@
-# NinjaTrader
+# Candle panel indicator
 
 <img width="377" height="444" alt="image" src="https://github.com/user-attachments/assets/958f8a88-5206-48e2-9360-3a67276d9773" />
 
