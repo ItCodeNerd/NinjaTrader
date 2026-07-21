@@ -7,6 +7,8 @@ Combined indicator plotting session VWAP, previous-day levels, fixed number line
 - **EMA Levels** — up to 4 EMAs, each with own period, color, show/hide toggle.
 - **VWAP** — multiple VWAP variants: full session, Asia/Europe/NY sessions, day-high/day-low anchored, weekly, rolling 24h, and previous-day NY/Session endpoints (dashed reference). Optional ±1/±2 standard-deviation bands. Session times configurable (ET, wraps overnight).
 - **Previous Week** — prior week high/low/close levels.
+- **Current Month** — current calendar month's high/low, live-updating as the month progresses, drawn from the month's first bar to the current bar.
+- **Last 4H Candle** — high/low of the last completed 4-hour candle, projected across the still-forming candle. Buckets anchored to the 18:00 ET Globex session open (18:00/22:00/02:00/06:00/10:00/14:00 ET), matching a real 4H chart on the instrument rather than a midnight-anchored clock grid.
 - **Prev Day – Value Area** — POC/value-area high-low from prior session. Value area method selectable (VolumeProfile, Uniform, LinearWeighted, CloseWeighted, TPO), value-area % (default 70), and bucket size in ticks.
 - **Prev Day – Previous Day** — Previous Day High/Low (PDH/PDL) and Previous Value Area High/Low (PVAH/PVAL), color and line width per line.
 - **Prev Day – Today** — today's running equivalents of the above levels, updated live.
