@@ -68,6 +68,8 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		private SharpDX.Direct2D1.Brush _dxMidnightOpenBrush;
 		private SharpDX.Direct2D1.Brush _dxNyOpenPriceBrush;
 		private SharpDX.Direct2D1.Brush _dxPwhBrush, _dxPwlBrush;
+		private SharpDX.Direct2D1.Brush _dxMonthHighBrush, _dxMonthLowBrush;
+		private SharpDX.Direct2D1.Brush _dx4hHighBrush, _dx4hLowBrush;
 		private double _asiaSessionHigh, _asiaSessionLow;
 		private bool _asiaSessionStarted;
 		private DateTime _asiaSessionStart, _asiaSessionEnd;
@@ -98,6 +100,20 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		private double _weekHigh, _weekLow, _prevWeekHigh, _prevWeekLow;
 		private bool _hasPrevWeek;
 		private DateTime _weekStartBar;
+		// Current Month High/Low
+		private DateTime _currentMonthStart, _monthStartBar;
+		private double _monthHigh, _monthLow;
+		private bool _hasMonth;
+		// Cached copy of the last bar's Time/High/Low, set ONLY from inside OnBarUpdate.
+		// OnRender must never read Time[0]/High[0]/Low[0] directly — NinjaTrader can invoke
+		// OnRender for repaint passes (scroll/zoom) where those indexers do not reliably
+		// reflect "today's forming bar," which was pulling Month Low down to a stale value.
+		private DateTime _lastBarTime;
+		private double _lastBarHigh, _lastBarLow;
+		// Last 4H Candle High/Low (4h buckets anchored at 00:00/04:00/08:00/12:00/16:00/20:00 ET)
+		private DateTime _current4hBucketStart;
+		private double _cur4hHigh, _cur4hLow, _last4hHigh, _last4hLow;
+		private bool _has4hCandle;
 		private double _dayHigh, _dayLow;
 		private bool _dayHighStarted, _dayLowStarted;
 		private double _currentPrice;
@@ -188,6 +204,8 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		private NTMenuItem ntVWAPSession, ntVWAPAsia, ntVWAPEurope, ntVWAPNY, ntVWAPDayHigh, ntVWAPDayLow, ntVWAPWeek, ntVWAP24h;
 		private NTMenuItem ntVWAPBands;
 		private NTMenuItem ntPWH, ntPWL;
+		private NTMenuItem ntMonthHigh, ntMonthLow;
+		private NTMenuItem nt4hHigh, nt4hLow;
 		private bool _showAllVWAP;
 
 		// PrevDayLevels menu items
@@ -277,6 +295,14 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				// ── Previous Week defaults ──
 				ShowPrevWeekHigh = true; ShowPrevWeekLow = true;
 				PrevWeekHighBrush = Brushes.Violet; PrevWeekLowBrush = Brushes.Violet;
+
+				// ── Current Month defaults ──
+				ShowMonthHigh = true; ShowMonthLow = true;
+				MonthHighBrush = Brushes.DeepSkyBlue; MonthLowBrush = Brushes.DeepSkyBlue;
+
+				// ── Last 4H Candle defaults ──
+				Show4hHigh = true; Show4hLow = true;
+				FourHHighBrush = Brushes.OrangeRed; FourHLowBrush = Brushes.OrangeRed;
 
 				// ── Midnight Open defaults ──
 				ShowMidnightOpen = true; MidnightOpenBrush = Brushes.White;
@@ -427,6 +453,16 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				_weekHigh = double.MinValue;
 				_weekLow = double.MaxValue;
 				_hasPrevWeek = false;
+				_currentMonthStart = DateTime.MinValue;
+				_monthHigh = double.MinValue;
+				_monthLow = double.MaxValue;
+				_hasMonth = false;
+				_current4hBucketStart = DateTime.MinValue;
+				_cur4hHigh = double.MinValue;
+				_cur4hLow = double.MaxValue;
+				_last4hHigh = double.MinValue;
+				_last4hLow = double.MaxValue;
+				_has4hCandle = false;
 				_lastMidnightNYDate = DateTime.MinValue;
 				_lastGlobexOpenNYDate = DateTime.MinValue;
 				_lastMidnightMinuteNYDate = DateTime.MinValue;
@@ -527,6 +563,10 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			if (BarsInProgress != 0) return;
 
 			// ── Main instrument only from here ─────────────────────────────
+
+			_lastBarTime = Time[0];
+			_lastBarHigh = High[0];
+			_lastBarLow = Low[0];
 
 			// ── VWAP ──────────────────────────────────────────────────────
 			DateTime barTime = Time[0];
@@ -751,6 +791,51 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				_lastVwapWeek = PlotVWAPWEEK[0];
 			}
 
+			// ── Current Month High/Low ───────────────────────────────────
+			DateTime monthAnchor = GetMonthlyAnchor(nyTime);
+			if (monthAnchor != _currentMonthStart)
+			{
+				_monthStartBar = Time[0];
+				_monthHigh = High[0];
+				_monthLow = Low[0];
+				_currentMonthStart = monthAnchor;
+				_hasMonth = true;
+			}
+			else
+			{
+				if (High[0] > _monthHigh) _monthHigh = High[0];
+				if (Low[0] < _monthLow) _monthLow = Low[0];
+			}
+
+			// ── Last 4H Candle High/Low ──────────────────────────────────
+			// Buckets anchored to the 18:00 ET Globex session open (same anchor used
+			// everywhere else in this file for day/session boundaries), giving edges at
+			// 18:00/22:00/02:00/06:00/10:00/14:00 ET — matching a real 4H chart on this
+			// instrument, NOT a midnight-anchored 00/04/08/12/16/20 clock grid.
+			// Bars are END-stamped: a bar stamped exactly on a 4h boundary still belongs
+			// to the OLD bucket, not the new one — back off a tick before flooring.
+			DateTime bucket4hRef = nyTime.AddTicks(-1);
+			DateTime bucket4hEpoch = new DateTime(2000, 1, 1, 18, 0, 0); // arbitrary reference exactly on the 18:00 grid
+			long bucket4hIndex = (long)Math.Floor((bucket4hRef - bucket4hEpoch).TotalHours / 4.0);
+			DateTime bucket4hStart = bucket4hEpoch.AddHours(bucket4hIndex * 4);
+			if (bucket4hStart != _current4hBucketStart)
+			{
+				if (_current4hBucketStart != DateTime.MinValue)
+				{
+					_last4hHigh = _cur4hHigh;
+					_last4hLow = _cur4hLow;
+					_has4hCandle = true;
+				}
+				_current4hBucketStart = bucket4hStart;
+				_cur4hHigh = High[0];
+				_cur4hLow = Low[0];
+			}
+			else
+			{
+				if (High[0] > _cur4hHigh) _cur4hHigh = High[0];
+				if (Low[0] < _cur4hLow) _cur4hLow = Low[0];
+			}
+
 			// Cache session-active flags for panel
 			_isAsiaActive = inAsia;
 			_isEuropeActive = inEurope;
@@ -933,6 +1018,10 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				_dxNYOpenLineBrush = NYOpenLineBrush.ToDxBrush(RenderTarget);
 				_dxPwhBrush = PrevWeekHighBrush.ToDxBrush(RenderTarget);
 				_dxPwlBrush = PrevWeekLowBrush.ToDxBrush(RenderTarget);
+				_dxMonthHighBrush = MonthHighBrush.ToDxBrush(RenderTarget);
+				_dxMonthLowBrush = MonthLowBrush.ToDxBrush(RenderTarget);
+				_dx4hHighBrush = FourHHighBrush.ToDxBrush(RenderTarget);
+				_dx4hLowBrush = FourHLowBrush.ToDxBrush(RenderTarget);
 				_dxIBHighBrush = IBHighBrush.ToDxBrush(RenderTarget);
 				_dxIBLowBrush = IBLowBrush.ToDxBrush(RenderTarget);
 				_dxIBExtBrush = IBExtBrush.ToDxBrush(RenderTarget);
@@ -981,6 +1070,10 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			if (_dxNYOpenLineBrush != null) { _dxNYOpenLineBrush.Dispose(); _dxNYOpenLineBrush = null; }
 			if (_dxPwhBrush != null) { _dxPwhBrush.Dispose(); _dxPwhBrush = null; }
 			if (_dxPwlBrush != null) { _dxPwlBrush.Dispose(); _dxPwlBrush = null; }
+			if (_dxMonthHighBrush != null) { _dxMonthHighBrush.Dispose(); _dxMonthHighBrush = null; }
+			if (_dxMonthLowBrush != null) { _dxMonthLowBrush.Dispose(); _dxMonthLowBrush = null; }
+			if (_dx4hHighBrush != null) { _dx4hHighBrush.Dispose(); _dx4hHighBrush = null; }
+			if (_dx4hLowBrush != null) { _dx4hLowBrush.Dispose(); _dx4hLowBrush = null; }
 			if (_dxIBHighBrush != null) { _dxIBHighBrush.Dispose(); _dxIBHighBrush = null; }
 			if (_dxIBLowBrush != null) { _dxIBLowBrush.Dispose(); _dxIBLowBrush = null; }
 			if (_dxIBExtBrush != null) { _dxIBExtBrush.Dispose(); _dxIBExtBrush = null; }
@@ -1165,6 +1258,68 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 						float lxw = Math.Min(xw1, canvasRight - 5f);
 						if (ShowPrevWeekHigh) RenderLabelAt("Prev Week High " + _prevWeekHigh.ToString("F2"), _prevWeekHigh, lxw, labelH, chartScale, _dxPwhBrush);
 						if (ShowPrevWeekLow) RenderLabelAt("Prev Week Low " + _prevWeekLow.ToString("F2"), _prevWeekLow, lxw, labelH, chartScale, _dxPwlBrush);
+					}
+				}
+			}
+
+			// ── Current Month High/Low ─────────────────────────────────────────
+			if ((_hasMonth || CurrentBar >= 0) && _dxMonthHighBrush != null && _dxMonthLowBrush != null && _cachedNYTimeZone != null)
+			{
+				// Blend in the still-forming last bar's High/Low so the level is correct
+				// the instant the chart renders, without waiting for that bar to close
+				// (OnBarUpdate/Calculate.OnBarClose only commits _monthHigh/_monthLow at close).
+				// Uses the OnBarUpdate-cached _lastBar* copies, NOT Time[0]/High[0]/Low[0]
+				// directly — those indexers are not reliable inside OnRender (repaint passes
+				// can be invoked in a context where they don't reflect today's forming bar).
+				double effMonthHigh = _monthHigh;
+				double effMonthLow = _monthLow;
+				DateTime effMonthStartBar = _monthStartBar;
+				if (!_hasMonth)
+				{
+					// Nothing committed yet (e.g. very first bar) — seed from this bar only.
+					effMonthHigh = _lastBarHigh;
+					effMonthLow = _lastBarLow;
+					effMonthStartBar = _lastBarTime;
+				}
+				else
+				{
+					// Always accumulate against the committed month — never discard it wholesale,
+					// even if this forming bar already belongs to a newer (not-yet-closed) month.
+					// Discarding would collapse High/Low to a single not-yet-formed bar's tiny
+					// range; a brief old+new blend at the exact rollover instant is preferable.
+					if (_lastBarHigh > effMonthHigh) effMonthHigh = _lastBarHigh;
+					if (_lastBarLow < effMonthLow) effMonthLow = _lastBarLow;
+				}
+
+				float xmo0 = Math.Max(GetXForTime(chartControl, effMonthStartBar), canvasLeft);
+				float xmo1 = canvasRight;
+				if (xmo1 > xmo0)
+				{
+					if (ShowMonthHigh) DrawSharpDXLine(xmo0, xmo1, chartScale.GetYByValue(effMonthHigh), _dxMonthHighBrush, 2, DashStyleHelper.Solid);
+					if (ShowMonthLow) DrawSharpDXLine(xmo0, xmo1, chartScale.GetYByValue(effMonthLow), _dxMonthLowBrush, 2, DashStyleHelper.Solid);
+					if (ShowLineLabels && _textFormat != null)
+					{
+						float lxmo = Math.Min(xmo1, canvasRight - 5f);
+						if (ShowMonthHigh) RenderLabelAt("Month High " + effMonthHigh.ToString("F2"), effMonthHigh, lxmo, labelH, chartScale, _dxMonthHighBrush);
+						if (ShowMonthLow) RenderLabelAt("Month Low " + effMonthLow.ToString("F2"), effMonthLow, lxmo, labelH, chartScale, _dxMonthLowBrush);
+					}
+				}
+			}
+
+			// ── Last 4H Candle High/Low ─────────────────────────────────────────
+			if (_has4hCandle && _dx4hHighBrush != null && _dx4hLowBrush != null)
+			{
+				float x4h0 = Math.Max(GetXForTime(chartControl, _current4hBucketStart), canvasLeft);
+				float x4h1 = canvasRight;
+				if (x4h1 > x4h0)
+				{
+					if (Show4hHigh) DrawSharpDXLine(x4h0, x4h1, chartScale.GetYByValue(_last4hHigh), _dx4hHighBrush, 2, DashStyleHelper.Dash);
+					if (Show4hLow) DrawSharpDXLine(x4h0, x4h1, chartScale.GetYByValue(_last4hLow), _dx4hLowBrush, 2, DashStyleHelper.Dash);
+					if (ShowLineLabels && _textFormat != null)
+					{
+						float lx4h = Math.Min(x4h1, canvasRight - 5f);
+						if (Show4hHigh) RenderLabelAt("4H High " + _last4hHigh.ToString("F2"), _last4hHigh, lx4h, labelH, chartScale, _dx4hHighBrush);
+						if (Show4hLow) RenderLabelAt("4H Low " + _last4hLow.ToString("F2"), _last4hLow, lx4h, labelH, chartScale, _dx4hLowBrush);
 					}
 				}
 			}
@@ -1414,6 +1569,18 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			// If we're earlier than this Sunday's 18:00, the active anchor is last Sunday's 18:00
 			if (nyTime < anchor)
 				anchor = anchor.AddDays(-7);
+			return anchor;
+		}
+
+		// Returns the most recent month-start 18:00 ET Globex-session anchor
+		// (18:00 ET on the last calendar day of the PRIOR month, kicking off day 1's
+		// session) preceding (or equal to) the given NY time. Same candidate/rollback
+		// style as GetWeeklyAnchor — avoids fragile exact-boundary tick math.
+		private static DateTime GetMonthlyAnchor(DateTime nyTime)
+		{
+			DateTime anchor = new DateTime(nyTime.Year, nyTime.Month, 1) - new TimeSpan(6, 0, 0);
+			if (nyTime < anchor)
+				anchor = anchor.AddMonths(-1);
 			return anchor;
 		}
 
@@ -1885,6 +2052,26 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				ntWeekMenu.Items.Add(ntPWL);
 				ntBartopMenuItem.Items.Add(ntWeekMenu);
 
+				// ── Month submenu ─────────────────────────────────────────
+				ntMonthHigh = MakeColoredItem(ShowMonthHigh ? "Hide Month High" : "Show Month High", MonthHighBrush as System.Windows.Media.Brush ?? Brushes.DeepSkyBlue); ntMonthHigh.Tag = "ShowMonthHigh";
+				ntMonthLow = MakeColoredItem(ShowMonthLow ? "Hide Month Low" : "Show Month Low", MonthLowBrush as System.Windows.Media.Brush ?? Brushes.DeepSkyBlue); ntMonthLow.Tag = "ShowMonthLow";
+				ntMonthHigh.Click += NTBarMenu_Click;
+				ntMonthLow.Click += NTBarMenu_Click;
+				var ntMonthMenu = new NTMenuItem { Header = "Month", Background = Brushes.Black, Foreground = Brushes.WhiteSmoke, Icon = MakeGutterIcon() };
+				ntMonthMenu.Items.Add(ntMonthHigh);
+				ntMonthMenu.Items.Add(ntMonthLow);
+				ntBartopMenuItem.Items.Add(ntMonthMenu);
+
+				// ── 4H Candle submenu ──────────────────────────────────────
+				nt4hHigh = MakeColoredItem(Show4hHigh ? "Hide 4H High" : "Show 4H High", FourHHighBrush as System.Windows.Media.Brush ?? Brushes.OrangeRed); nt4hHigh.Tag = "Show4hHigh";
+				nt4hLow = MakeColoredItem(Show4hLow ? "Hide 4H Low" : "Show 4H Low", FourHLowBrush as System.Windows.Media.Brush ?? Brushes.OrangeRed); nt4hLow.Tag = "Show4hLow";
+				nt4hHigh.Click += NTBarMenu_Click;
+				nt4hLow.Click += NTBarMenu_Click;
+				var nt4hMenu = new NTMenuItem { Header = "4H Candle", Background = Brushes.Black, Foreground = Brushes.WhiteSmoke, Icon = MakeGutterIcon() };
+				nt4hMenu.Items.Add(nt4hHigh);
+				nt4hMenu.Items.Add(nt4hLow);
+				ntBartopMenuItem.Items.Add(nt4hMenu);
+
 				_showAllHistoric = ShowHistoricLines && ShowPDH && ShowPDL && ShowPVAH && ShowPVAL && ShowPrevPOC;
 				_showAllToday = ShowTDH && ShowTDL && ShowTPVAH && ShowTPVAL && ShowPOC && ShowGlobexOpen && ShowMidnightOpen && ShowNYOpenPrice;
 				_showAllPDL = _showAllHistoric && _showAllToday;
@@ -1926,7 +2113,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				ntPOC = MakeColoredItem(ShowPOC ? "Hide Point of Control" : "Show Point of Control", PocBrush as System.Windows.Media.Brush ?? Brushes.White); ntPOC.Tag = "ShowPOC";
 				ntGlobexOpen = MakeColoredItem(ShowGlobexOpen ? "Hide Globex Open" : "Show Globex Open", GlobexOpenBrush as System.Windows.Media.Brush ?? Brushes.Yellow); ntGlobexOpen.Tag = "ShowGlobexOpen";
 				ntMidnightOpen = MakeColoredItem(ShowMidnightOpen ? "Hide Midnight Open" : "Show Midnight Open", MidnightOpenBrush as System.Windows.Media.Brush ?? Brushes.White); ntMidnightOpen.Tag = "ShowMidnightOpen";
-			ntNYOpenPrice = MakeColoredItem(ShowNYOpenPrice ? "Hide NY Open Price" : "Show NY Open Price", NYOpenPriceBrush as System.Windows.Media.Brush ?? Brushes.Cyan); ntNYOpenPrice.Tag = "ShowNYOpenPrice";
+				ntNYOpenPrice = MakeColoredItem(ShowNYOpenPrice ? "Hide NY Open Price" : "Show NY Open Price", NYOpenPriceBrush as System.Windows.Media.Brush ?? Brushes.Cyan); ntNYOpenPrice.Tag = "ShowNYOpenPrice";
 				ntTodayPDH = MakeColoredItem(ShowPDH ? "Hide Prev Day High" : "Show Prev Day High", PdhBrush as System.Windows.Media.Brush ?? Brushes.DodgerBlue); ntTodayPDH.Tag = "ShowPDH";
 				ntTodayPDL = MakeColoredItem(ShowPDL ? "Hide Prev Day Low" : "Show Prev Day Low", PdlBrush as System.Windows.Media.Brush ?? Brushes.DodgerBlue); ntTodayPDL.Tag = "ShowPDL";
 				ntDayOpenLine = MakeColoredItem(ShowDayOpenLine ? "Hide Day Open Line" : "Show Day Open Line", DayOpenLineBrush as System.Windows.Media.Brush ?? Brushes.White); ntDayOpenLine.Tag = "ShowDayOpenLine";
@@ -1940,7 +2127,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				ntPOC.Click += NTBarMenu_Click;
 				ntGlobexOpen.Click += NTBarMenu_Click;
 				ntMidnightOpen.Click += NTBarMenu_Click;
-			ntNYOpenPrice.Click += NTBarMenu_Click;
+				ntNYOpenPrice.Click += NTBarMenu_Click;
 				ntTodayPDH.Click += NTBarMenu_Click;
 				ntTodayPDL.Click += NTBarMenu_Click;
 				ntDayOpenLine.Click += NTBarMenu_Click;
@@ -1957,7 +2144,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				ntTodayMenu.Items.Add(ntPOC);
 				ntTodayMenu.Items.Add(ntGlobexOpen);
 				ntTodayMenu.Items.Add(ntMidnightOpen);
-			ntTodayMenu.Items.Add(ntNYOpenPrice);
+				ntTodayMenu.Items.Add(ntNYOpenPrice);
 				ntTodayMenu.Items.Add(ntDayOpenLine);
 				ntBartopMenuItem.Items.Add(ntTodayMenu);
 				ntBartopMenuItem.Items.Add(new Separator());
@@ -2044,6 +2231,8 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 						ShowTodayVABackground = _showAll;
 						// Week
 						ShowPrevWeekHigh = ShowPrevWeekLow = _showAll;
+						// Month / 4H Candle
+						ShowMonthHigh = ShowMonthLow = Show4hHigh = Show4hLow = _showAll;
 						// ORB / Initial Balance
 						ShowORB = ShowAsiaORB = ShowEuropeORB = ShowIB = ShowIBExtensions = _showAll;
 						// Session high/low
@@ -2081,6 +2270,10 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 					case "ShowVwap24h": ShowVwap24h = !ShowVwap24h; break;
 					case "ShowPrevWeekHigh": ShowPrevWeekHigh = !ShowPrevWeekHigh; break;
 					case "ShowPrevWeekLow": ShowPrevWeekLow = !ShowPrevWeekLow; break;
+					case "ShowMonthHigh": ShowMonthHigh = !ShowMonthHigh; break;
+					case "ShowMonthLow": ShowMonthLow = !ShowMonthLow; break;
+					case "Show4hHigh": Show4hHigh = !Show4hHigh; break;
+					case "Show4hLow": Show4hLow = !Show4hLow; break;
 					case "ShowAllPDL":
 						_showAllPDL = !_showAllPDL;
 						ShowHistoricLines = ShowPDH = ShowPDL = ShowPVAH = ShowPVAL = ShowPrevPOC = _showAllPDL;
@@ -2108,7 +2301,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 					case "ShowPOC": ShowPOC = !ShowPOC; break;
 					case "ShowGlobexOpen": ShowGlobexOpen = !ShowGlobexOpen; break;
 					case "ShowMidnightOpen": ShowMidnightOpen = !ShowMidnightOpen; break;
-				case "ShowNYOpenPrice": ShowNYOpenPrice = !ShowNYOpenPrice; break;
+					case "ShowNYOpenPrice": ShowNYOpenPrice = !ShowNYOpenPrice; break;
 					case "ShowDayOpenLine": ShowDayOpenLine = !ShowDayOpenLine; break;
 					case "ShowAsiaOpenLine": ShowAsiaOpenLine = !ShowAsiaOpenLine; break;
 					case "ShowLondonOpenLine": ShowLondonOpenLine = !ShowLondonOpenLine; break;
@@ -2140,7 +2333,8 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 					bool _showAllORB = ShowORB && ShowAsiaORB && ShowEuropeORB && ShowIB && ShowIBExtensions;
 					_showAllEMA = ShowEma1 && ShowEma2 && ShowEma3 && ShowEma4;
 					_showAll = _showAllEMA && _showAllVWAP && _showAllPDL && _showAllORB && ShowFixedLines
-						&& ShowAsiaHighLow && ShowEuropeHighLow && ShowDayOpenLine && ShowAsiaOpenLine && ShowLondonOpenLine && ShowNYOpenLine;
+						&& ShowAsiaHighLow && ShowEuropeHighLow && ShowDayOpenLine && ShowAsiaOpenLine && ShowLondonOpenLine && ShowNYOpenLine
+						&& ShowMonthHigh && ShowMonthLow && Show4hHigh && Show4hLow;
 
 					ntShowHide.Header = _showAll ? "Hide All" : "Show All";
 					ntEMAShowHide.Header = _showAllEMA ? "Hide All EMA" : "Show All EMA";
@@ -2175,6 +2369,10 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 					ntVWAP24h.Header = ShowVwap24h ? "Hide 24h VWAP" : "Show 24h VWAP";
 					ntPWH.Header = ShowPrevWeekHigh ? "Hide Prev Week High" : "Show Prev Week High";
 					ntPWL.Header = ShowPrevWeekLow ? "Hide Prev Week Low" : "Show Prev Week Low";
+					ntMonthHigh.Header = ShowMonthHigh ? "Hide Month High" : "Show Month High";
+					ntMonthLow.Header = ShowMonthLow ? "Hide Month Low" : "Show Month Low";
+					nt4hHigh.Header = Show4hHigh ? "Hide 4H High" : "Show 4H High";
+					nt4hLow.Header = Show4hLow ? "Hide 4H Low" : "Show 4H Low";
 
 					ntPDH.Header = ShowPDH ? "Hide Prev Day High" : "Show Prev Day High";
 					ntPDL.Header = ShowPDL ? "Hide Prev Day Low" : "Show Prev Day Low";
@@ -2189,7 +2387,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 					ntPOC.Header = ShowPOC ? "Hide Point of Control" : "Show Point of Control";
 					ntGlobexOpen.Header = ShowGlobexOpen ? "Hide Globex Open" : "Show Globex Open";
 					ntMidnightOpen.Header = ShowMidnightOpen ? "Hide Midnight Open" : "Show Midnight Open";
-				ntNYOpenPrice.Header = ShowNYOpenPrice ? "Hide NY Open Price" : "Show NY Open Price";
+					ntNYOpenPrice.Header = ShowNYOpenPrice ? "Hide NY Open Price" : "Show NY Open Price";
 					ntDayOpenLine.Header = ShowDayOpenLine ? "Hide Day Open Line" : "Show Day Open Line";
 					ntAsiaOpenLine.Header = ShowAsiaOpenLine ? "Hide Asia Open Line" : "Show Asia Open Line";
 					ntLondonOpenLine.Header = ShowLondonOpenLine ? "Hide London Open Line" : "Show London Open Line";
@@ -2475,6 +2673,46 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		[XmlIgnore]
 		[Display(Name = "Prev Week Low Color", Description = "Color of the previous week low line.", Order = 3, GroupName = "1d. Previous Week")]
 		public Brush PrevWeekLowBrush { get; set; }
+		#endregion
+
+		#region Current Month
+		[NinjaScriptProperty]
+		[Display(Name = "Show Month High", Description = "Show/hide the current calendar month's high, live-updating.", Order = 0, GroupName = "1e. Current Month")]
+		public bool ShowMonthHigh { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Show Month Low", Description = "Show/hide the current calendar month's low, live-updating.", Order = 1, GroupName = "1e. Current Month")]
+		public bool ShowMonthLow { get; set; }
+
+		[NinjaScriptProperty]
+		[XmlIgnore]
+		[Display(Name = "Month High Color", Description = "Color of the current month high line.", Order = 2, GroupName = "1e. Current Month")]
+		public Brush MonthHighBrush { get; set; }
+
+		[NinjaScriptProperty]
+		[XmlIgnore]
+		[Display(Name = "Month Low Color", Description = "Color of the current month low line.", Order = 3, GroupName = "1e. Current Month")]
+		public Brush MonthLowBrush { get; set; }
+		#endregion
+
+		#region Last 4H Candle
+		[NinjaScriptProperty]
+		[Display(Name = "Show 4H High", Description = "Show/hide the last completed 4-hour candle's high, projected across the forming candle. Buckets anchored at 00:00/04:00/08:00/12:00/16:00/20:00 ET.", Order = 0, GroupName = "1f. Last 4H Candle")]
+		public bool Show4hHigh { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Show 4H Low", Description = "Show/hide the last completed 4-hour candle's low, projected across the forming candle.", Order = 1, GroupName = "1f. Last 4H Candle")]
+		public bool Show4hLow { get; set; }
+
+		[NinjaScriptProperty]
+		[XmlIgnore]
+		[Display(Name = "4H High Color", Description = "Color of the last 4H candle high line.", Order = 2, GroupName = "1f. Last 4H Candle")]
+		public Brush FourHHighBrush { get; set; }
+
+		[NinjaScriptProperty]
+		[XmlIgnore]
+		[Display(Name = "4H Low Color", Description = "Color of the last 4H candle low line.", Order = 3, GroupName = "1f. Last 4H Candle")]
+		public Brush FourHLowBrush { get; set; }
 		#endregion
 
 		#region PrevDayLevels – Value Area
@@ -2938,3 +3176,60 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		#endregion
 	}
 }
+
+#region NinjaScript generated code. Neither change nor remove.
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
+	{
+		private ItCodeNerd.ICNImportantLines[] cacheICNImportantLines;
+		public ItCodeNerd.ICNImportantLines ICNImportantLines(bool showEma1, int ema1Period, Brush ema1Brush, bool showEma2, int ema2Period, Brush ema2Brush, bool showEma3, int ema3Period, Brush ema3Brush, bool showEma4, int ema4Period, Brush ema4Brush, int asiaStartTime, int asiaEndTime, int europeStartTime, int europeEndTime, int nYStartTime, int nYEndTime, bool showSessionVWAP, bool showAsiaVWAP, bool showEuropeVWAP, bool showNYVWAP, bool showDayHighVWAP, bool showDayLowVWAP, bool showWeeklyVWAP, bool showVwap24h, bool showPDVwapNY, bool showPDVwapSession, System.Windows.Media.Color pDVwapNYColor, System.Windows.Media.Color pDVwapSessionColor, bool showVwapBands, Brush vwap1SDBrush, Brush vwap2SDBrush, bool showPrevWeekHigh, bool showPrevWeekLow, Brush prevWeekHighBrush, Brush prevWeekLowBrush, bool showMonthHigh, bool showMonthLow, Brush monthHighBrush, Brush monthLowBrush, bool show4hHigh, bool show4hLow, Brush fourHHighBrush, Brush fourHLowBrush, ValueAreaMethod vAMethod, double valueAreaPercent, int ticksPerBucket, Brush pdhBrush, Brush pdlBrush, Brush pvahBrush, Brush pvalBrush, int pdLineWidth, int pvaLineWidth, DashStyleHelper pdDashStyle, DashStyleHelper pvaDashStyle, Brush tdhBrush, Brush tdlBrush, Brush tpvahBrush, Brush tpvalBrush, int tdLineWidth, int tpvaLineWidth, DashStyleHelper tdDashStyle, DashStyleHelper tpvaDashStyle, bool showHistoricLines, bool showPDH, bool showPDL, bool showPVAH, bool showPVAL, bool showTDH, bool showTDL, bool showTodayVABackground, System.Windows.Media.Color todayVABackgroundColor, bool showTPVAH, bool showTPVAL, bool showPOC, bool showPrevPOC, Brush pocBrush, int pocLineWidth, DashStyleHelper pocDashStyle, bool showLineLabels, int labelFontSize, bool showIB, int iBMinutes, Brush iBHighBrush, Brush iBLowBrush, int iBLineWidth, DashStyleHelper iBDashStyle, bool showIBExtensions, Brush iBExtBrush, bool showORB, int oRBMinutes, Brush orbHighBrush, Brush orbLowBrush, int orbLineWidth, DashStyleHelper orbDashStyle, bool showAsiaORB, int asiaORBMinutes, Brush asiaOrbHighBrush, Brush asiaOrbLowBrush, bool showEuropeORB, int europeORBMinutes, Brush europeOrbHighBrush, Brush europeOrbLowBrush, bool showAsiaHighLow, Brush asiaHighBrush, Brush asiaLowBrush, bool showEuropeHighLow, Brush europeHighBrush, Brush europeLowBrush, bool showGlobexOpen, Brush globexOpenBrush, int globexLineWidth, DashStyleHelper globexDashStyle, bool showMidnightOpen, Brush midnightOpenBrush, int midnightLineWidth, DashStyleHelper midnightDashStyle, bool showNYOpenPrice, Brush nYOpenPriceBrush, int nYOpenPriceLineWidth, DashStyleHelper nYOpenPriceDashStyle, bool showDayOpenLine, Brush dayOpenLineBrush, bool showAsiaOpenLine, Brush asiaOpenLineBrush, bool showLondonOpenLine, Brush londonOpenLineBrush, bool showNYOpenLine, Brush nYOpenLineBrush, int verticalLineWidth, DashStyleHelper verticalLineDashStyle, Brush fixedLinesColor, double fixedLinesStep, int fixedLinesRange, bool showFixedLines)
+		{
+			return ICNImportantLines(Input, showEma1, ema1Period, ema1Brush, showEma2, ema2Period, ema2Brush, showEma3, ema3Period, ema3Brush, showEma4, ema4Period, ema4Brush, asiaStartTime, asiaEndTime, europeStartTime, europeEndTime, nYStartTime, nYEndTime, showSessionVWAP, showAsiaVWAP, showEuropeVWAP, showNYVWAP, showDayHighVWAP, showDayLowVWAP, showWeeklyVWAP, showVwap24h, showPDVwapNY, showPDVwapSession, pDVwapNYColor, pDVwapSessionColor, showVwapBands, vwap1SDBrush, vwap2SDBrush, showPrevWeekHigh, showPrevWeekLow, prevWeekHighBrush, prevWeekLowBrush, showMonthHigh, showMonthLow, monthHighBrush, monthLowBrush, show4hHigh, show4hLow, fourHHighBrush, fourHLowBrush, vAMethod, valueAreaPercent, ticksPerBucket, pdhBrush, pdlBrush, pvahBrush, pvalBrush, pdLineWidth, pvaLineWidth, pdDashStyle, pvaDashStyle, tdhBrush, tdlBrush, tpvahBrush, tpvalBrush, tdLineWidth, tpvaLineWidth, tdDashStyle, tpvaDashStyle, showHistoricLines, showPDH, showPDL, showPVAH, showPVAL, showTDH, showTDL, showTodayVABackground, todayVABackgroundColor, showTPVAH, showTPVAL, showPOC, showPrevPOC, pocBrush, pocLineWidth, pocDashStyle, showLineLabels, labelFontSize, showIB, iBMinutes, iBHighBrush, iBLowBrush, iBLineWidth, iBDashStyle, showIBExtensions, iBExtBrush, showORB, oRBMinutes, orbHighBrush, orbLowBrush, orbLineWidth, orbDashStyle, showAsiaORB, asiaORBMinutes, asiaOrbHighBrush, asiaOrbLowBrush, showEuropeORB, europeORBMinutes, europeOrbHighBrush, europeOrbLowBrush, showAsiaHighLow, asiaHighBrush, asiaLowBrush, showEuropeHighLow, europeHighBrush, europeLowBrush, showGlobexOpen, globexOpenBrush, globexLineWidth, globexDashStyle, showMidnightOpen, midnightOpenBrush, midnightLineWidth, midnightDashStyle, showNYOpenPrice, nYOpenPriceBrush, nYOpenPriceLineWidth, nYOpenPriceDashStyle, showDayOpenLine, dayOpenLineBrush, showAsiaOpenLine, asiaOpenLineBrush, showLondonOpenLine, londonOpenLineBrush, showNYOpenLine, nYOpenLineBrush, verticalLineWidth, verticalLineDashStyle, fixedLinesColor, fixedLinesStep, fixedLinesRange, showFixedLines);
+		}
+
+		public ItCodeNerd.ICNImportantLines ICNImportantLines(ISeries<double> input, bool showEma1, int ema1Period, Brush ema1Brush, bool showEma2, int ema2Period, Brush ema2Brush, bool showEma3, int ema3Period, Brush ema3Brush, bool showEma4, int ema4Period, Brush ema4Brush, int asiaStartTime, int asiaEndTime, int europeStartTime, int europeEndTime, int nYStartTime, int nYEndTime, bool showSessionVWAP, bool showAsiaVWAP, bool showEuropeVWAP, bool showNYVWAP, bool showDayHighVWAP, bool showDayLowVWAP, bool showWeeklyVWAP, bool showVwap24h, bool showPDVwapNY, bool showPDVwapSession, System.Windows.Media.Color pDVwapNYColor, System.Windows.Media.Color pDVwapSessionColor, bool showVwapBands, Brush vwap1SDBrush, Brush vwap2SDBrush, bool showPrevWeekHigh, bool showPrevWeekLow, Brush prevWeekHighBrush, Brush prevWeekLowBrush, bool showMonthHigh, bool showMonthLow, Brush monthHighBrush, Brush monthLowBrush, bool show4hHigh, bool show4hLow, Brush fourHHighBrush, Brush fourHLowBrush, ValueAreaMethod vAMethod, double valueAreaPercent, int ticksPerBucket, Brush pdhBrush, Brush pdlBrush, Brush pvahBrush, Brush pvalBrush, int pdLineWidth, int pvaLineWidth, DashStyleHelper pdDashStyle, DashStyleHelper pvaDashStyle, Brush tdhBrush, Brush tdlBrush, Brush tpvahBrush, Brush tpvalBrush, int tdLineWidth, int tpvaLineWidth, DashStyleHelper tdDashStyle, DashStyleHelper tpvaDashStyle, bool showHistoricLines, bool showPDH, bool showPDL, bool showPVAH, bool showPVAL, bool showTDH, bool showTDL, bool showTodayVABackground, System.Windows.Media.Color todayVABackgroundColor, bool showTPVAH, bool showTPVAL, bool showPOC, bool showPrevPOC, Brush pocBrush, int pocLineWidth, DashStyleHelper pocDashStyle, bool showLineLabels, int labelFontSize, bool showIB, int iBMinutes, Brush iBHighBrush, Brush iBLowBrush, int iBLineWidth, DashStyleHelper iBDashStyle, bool showIBExtensions, Brush iBExtBrush, bool showORB, int oRBMinutes, Brush orbHighBrush, Brush orbLowBrush, int orbLineWidth, DashStyleHelper orbDashStyle, bool showAsiaORB, int asiaORBMinutes, Brush asiaOrbHighBrush, Brush asiaOrbLowBrush, bool showEuropeORB, int europeORBMinutes, Brush europeOrbHighBrush, Brush europeOrbLowBrush, bool showAsiaHighLow, Brush asiaHighBrush, Brush asiaLowBrush, bool showEuropeHighLow, Brush europeHighBrush, Brush europeLowBrush, bool showGlobexOpen, Brush globexOpenBrush, int globexLineWidth, DashStyleHelper globexDashStyle, bool showMidnightOpen, Brush midnightOpenBrush, int midnightLineWidth, DashStyleHelper midnightDashStyle, bool showNYOpenPrice, Brush nYOpenPriceBrush, int nYOpenPriceLineWidth, DashStyleHelper nYOpenPriceDashStyle, bool showDayOpenLine, Brush dayOpenLineBrush, bool showAsiaOpenLine, Brush asiaOpenLineBrush, bool showLondonOpenLine, Brush londonOpenLineBrush, bool showNYOpenLine, Brush nYOpenLineBrush, int verticalLineWidth, DashStyleHelper verticalLineDashStyle, Brush fixedLinesColor, double fixedLinesStep, int fixedLinesRange, bool showFixedLines)
+		{
+			if (cacheICNImportantLines != null)
+				for (int idx = 0; idx < cacheICNImportantLines.Length; idx++)
+					if (cacheICNImportantLines[idx] != null && cacheICNImportantLines[idx].ShowEma1 == showEma1 && cacheICNImportantLines[idx].Ema1Period == ema1Period && cacheICNImportantLines[idx].Ema1Brush == ema1Brush && cacheICNImportantLines[idx].ShowEma2 == showEma2 && cacheICNImportantLines[idx].Ema2Period == ema2Period && cacheICNImportantLines[idx].Ema2Brush == ema2Brush && cacheICNImportantLines[idx].ShowEma3 == showEma3 && cacheICNImportantLines[idx].Ema3Period == ema3Period && cacheICNImportantLines[idx].Ema3Brush == ema3Brush && cacheICNImportantLines[idx].ShowEma4 == showEma4 && cacheICNImportantLines[idx].Ema4Period == ema4Period && cacheICNImportantLines[idx].Ema4Brush == ema4Brush && cacheICNImportantLines[idx].AsiaStartTime == asiaStartTime && cacheICNImportantLines[idx].AsiaEndTime == asiaEndTime && cacheICNImportantLines[idx].EuropeStartTime == europeStartTime && cacheICNImportantLines[idx].EuropeEndTime == europeEndTime && cacheICNImportantLines[idx].NYStartTime == nYStartTime && cacheICNImportantLines[idx].NYEndTime == nYEndTime && cacheICNImportantLines[idx].ShowSessionVWAP == showSessionVWAP && cacheICNImportantLines[idx].ShowAsiaVWAP == showAsiaVWAP && cacheICNImportantLines[idx].ShowEuropeVWAP == showEuropeVWAP && cacheICNImportantLines[idx].ShowNYVWAP == showNYVWAP && cacheICNImportantLines[idx].ShowDayHighVWAP == showDayHighVWAP && cacheICNImportantLines[idx].ShowDayLowVWAP == showDayLowVWAP && cacheICNImportantLines[idx].ShowWeeklyVWAP == showWeeklyVWAP && cacheICNImportantLines[idx].ShowVwap24h == showVwap24h && cacheICNImportantLines[idx].ShowPDVwapNY == showPDVwapNY && cacheICNImportantLines[idx].ShowPDVwapSession == showPDVwapSession && cacheICNImportantLines[idx].PDVwapNYColor == pDVwapNYColor && cacheICNImportantLines[idx].PDVwapSessionColor == pDVwapSessionColor && cacheICNImportantLines[idx].ShowVwapBands == showVwapBands && cacheICNImportantLines[idx].Vwap1SDBrush == vwap1SDBrush && cacheICNImportantLines[idx].Vwap2SDBrush == vwap2SDBrush && cacheICNImportantLines[idx].ShowPrevWeekHigh == showPrevWeekHigh && cacheICNImportantLines[idx].ShowPrevWeekLow == showPrevWeekLow && cacheICNImportantLines[idx].PrevWeekHighBrush == prevWeekHighBrush && cacheICNImportantLines[idx].PrevWeekLowBrush == prevWeekLowBrush && cacheICNImportantLines[idx].ShowMonthHigh == showMonthHigh && cacheICNImportantLines[idx].ShowMonthLow == showMonthLow && cacheICNImportantLines[idx].MonthHighBrush == monthHighBrush && cacheICNImportantLines[idx].MonthLowBrush == monthLowBrush && cacheICNImportantLines[idx].Show4hHigh == show4hHigh && cacheICNImportantLines[idx].Show4hLow == show4hLow && cacheICNImportantLines[idx].FourHHighBrush == fourHHighBrush && cacheICNImportantLines[idx].FourHLowBrush == fourHLowBrush && cacheICNImportantLines[idx].VAMethod == vAMethod && cacheICNImportantLines[idx].ValueAreaPercent == valueAreaPercent && cacheICNImportantLines[idx].TicksPerBucket == ticksPerBucket && cacheICNImportantLines[idx].PdhBrush == pdhBrush && cacheICNImportantLines[idx].PdlBrush == pdlBrush && cacheICNImportantLines[idx].PvahBrush == pvahBrush && cacheICNImportantLines[idx].PvalBrush == pvalBrush && cacheICNImportantLines[idx].PdLineWidth == pdLineWidth && cacheICNImportantLines[idx].PvaLineWidth == pvaLineWidth && cacheICNImportantLines[idx].PdDashStyle == pdDashStyle && cacheICNImportantLines[idx].PvaDashStyle == pvaDashStyle && cacheICNImportantLines[idx].TdhBrush == tdhBrush && cacheICNImportantLines[idx].TdlBrush == tdlBrush && cacheICNImportantLines[idx].TpvahBrush == tpvahBrush && cacheICNImportantLines[idx].TpvalBrush == tpvalBrush && cacheICNImportantLines[idx].TdLineWidth == tdLineWidth && cacheICNImportantLines[idx].TpvaLineWidth == tpvaLineWidth && cacheICNImportantLines[idx].TdDashStyle == tdDashStyle && cacheICNImportantLines[idx].TpvaDashStyle == tpvaDashStyle && cacheICNImportantLines[idx].ShowHistoricLines == showHistoricLines && cacheICNImportantLines[idx].ShowPDH == showPDH && cacheICNImportantLines[idx].ShowPDL == showPDL && cacheICNImportantLines[idx].ShowPVAH == showPVAH && cacheICNImportantLines[idx].ShowPVAL == showPVAL && cacheICNImportantLines[idx].ShowTDH == showTDH && cacheICNImportantLines[idx].ShowTDL == showTDL && cacheICNImportantLines[idx].ShowTodayVABackground == showTodayVABackground && cacheICNImportantLines[idx].TodayVABackgroundColor == todayVABackgroundColor && cacheICNImportantLines[idx].ShowTPVAH == showTPVAH && cacheICNImportantLines[idx].ShowTPVAL == showTPVAL && cacheICNImportantLines[idx].ShowPOC == showPOC && cacheICNImportantLines[idx].ShowPrevPOC == showPrevPOC && cacheICNImportantLines[idx].PocBrush == pocBrush && cacheICNImportantLines[idx].PocLineWidth == pocLineWidth && cacheICNImportantLines[idx].PocDashStyle == pocDashStyle && cacheICNImportantLines[idx].ShowLineLabels == showLineLabels && cacheICNImportantLines[idx].LabelFontSize == labelFontSize && cacheICNImportantLines[idx].ShowIB == showIB && cacheICNImportantLines[idx].IBMinutes == iBMinutes && cacheICNImportantLines[idx].IBHighBrush == iBHighBrush && cacheICNImportantLines[idx].IBLowBrush == iBLowBrush && cacheICNImportantLines[idx].IBLineWidth == iBLineWidth && cacheICNImportantLines[idx].IBDashStyle == iBDashStyle && cacheICNImportantLines[idx].ShowIBExtensions == showIBExtensions && cacheICNImportantLines[idx].IBExtBrush == iBExtBrush && cacheICNImportantLines[idx].ShowORB == showORB && cacheICNImportantLines[idx].ORBMinutes == oRBMinutes && cacheICNImportantLines[idx].OrbHighBrush == orbHighBrush && cacheICNImportantLines[idx].OrbLowBrush == orbLowBrush && cacheICNImportantLines[idx].OrbLineWidth == orbLineWidth && cacheICNImportantLines[idx].OrbDashStyle == orbDashStyle && cacheICNImportantLines[idx].ShowAsiaORB == showAsiaORB && cacheICNImportantLines[idx].AsiaORBMinutes == asiaORBMinutes && cacheICNImportantLines[idx].AsiaOrbHighBrush == asiaOrbHighBrush && cacheICNImportantLines[idx].AsiaOrbLowBrush == asiaOrbLowBrush && cacheICNImportantLines[idx].ShowEuropeORB == showEuropeORB && cacheICNImportantLines[idx].EuropeORBMinutes == europeORBMinutes && cacheICNImportantLines[idx].EuropeOrbHighBrush == europeOrbHighBrush && cacheICNImportantLines[idx].EuropeOrbLowBrush == europeOrbLowBrush && cacheICNImportantLines[idx].ShowAsiaHighLow == showAsiaHighLow && cacheICNImportantLines[idx].AsiaHighBrush == asiaHighBrush && cacheICNImportantLines[idx].AsiaLowBrush == asiaLowBrush && cacheICNImportantLines[idx].ShowEuropeHighLow == showEuropeHighLow && cacheICNImportantLines[idx].EuropeHighBrush == europeHighBrush && cacheICNImportantLines[idx].EuropeLowBrush == europeLowBrush && cacheICNImportantLines[idx].ShowGlobexOpen == showGlobexOpen && cacheICNImportantLines[idx].GlobexOpenBrush == globexOpenBrush && cacheICNImportantLines[idx].GlobexLineWidth == globexLineWidth && cacheICNImportantLines[idx].GlobexDashStyle == globexDashStyle && cacheICNImportantLines[idx].ShowMidnightOpen == showMidnightOpen && cacheICNImportantLines[idx].MidnightOpenBrush == midnightOpenBrush && cacheICNImportantLines[idx].MidnightLineWidth == midnightLineWidth && cacheICNImportantLines[idx].MidnightDashStyle == midnightDashStyle && cacheICNImportantLines[idx].ShowNYOpenPrice == showNYOpenPrice && cacheICNImportantLines[idx].NYOpenPriceBrush == nYOpenPriceBrush && cacheICNImportantLines[idx].NYOpenPriceLineWidth == nYOpenPriceLineWidth && cacheICNImportantLines[idx].NYOpenPriceDashStyle == nYOpenPriceDashStyle && cacheICNImportantLines[idx].ShowDayOpenLine == showDayOpenLine && cacheICNImportantLines[idx].DayOpenLineBrush == dayOpenLineBrush && cacheICNImportantLines[idx].ShowAsiaOpenLine == showAsiaOpenLine && cacheICNImportantLines[idx].AsiaOpenLineBrush == asiaOpenLineBrush && cacheICNImportantLines[idx].ShowLondonOpenLine == showLondonOpenLine && cacheICNImportantLines[idx].LondonOpenLineBrush == londonOpenLineBrush && cacheICNImportantLines[idx].ShowNYOpenLine == showNYOpenLine && cacheICNImportantLines[idx].NYOpenLineBrush == nYOpenLineBrush && cacheICNImportantLines[idx].VerticalLineWidth == verticalLineWidth && cacheICNImportantLines[idx].VerticalLineDashStyle == verticalLineDashStyle && cacheICNImportantLines[idx].FixedLinesColor == fixedLinesColor && cacheICNImportantLines[idx].FixedLinesStep == fixedLinesStep && cacheICNImportantLines[idx].FixedLinesRange == fixedLinesRange && cacheICNImportantLines[idx].ShowFixedLines == showFixedLines && cacheICNImportantLines[idx].EqualsInput(input))
+						return cacheICNImportantLines[idx];
+			return CacheIndicator<ItCodeNerd.ICNImportantLines>(new ItCodeNerd.ICNImportantLines(){ ShowEma1 = showEma1, Ema1Period = ema1Period, Ema1Brush = ema1Brush, ShowEma2 = showEma2, Ema2Period = ema2Period, Ema2Brush = ema2Brush, ShowEma3 = showEma3, Ema3Period = ema3Period, Ema3Brush = ema3Brush, ShowEma4 = showEma4, Ema4Period = ema4Period, Ema4Brush = ema4Brush, AsiaStartTime = asiaStartTime, AsiaEndTime = asiaEndTime, EuropeStartTime = europeStartTime, EuropeEndTime = europeEndTime, NYStartTime = nYStartTime, NYEndTime = nYEndTime, ShowSessionVWAP = showSessionVWAP, ShowAsiaVWAP = showAsiaVWAP, ShowEuropeVWAP = showEuropeVWAP, ShowNYVWAP = showNYVWAP, ShowDayHighVWAP = showDayHighVWAP, ShowDayLowVWAP = showDayLowVWAP, ShowWeeklyVWAP = showWeeklyVWAP, ShowVwap24h = showVwap24h, ShowPDVwapNY = showPDVwapNY, ShowPDVwapSession = showPDVwapSession, PDVwapNYColor = pDVwapNYColor, PDVwapSessionColor = pDVwapSessionColor, ShowVwapBands = showVwapBands, Vwap1SDBrush = vwap1SDBrush, Vwap2SDBrush = vwap2SDBrush, ShowPrevWeekHigh = showPrevWeekHigh, ShowPrevWeekLow = showPrevWeekLow, PrevWeekHighBrush = prevWeekHighBrush, PrevWeekLowBrush = prevWeekLowBrush, ShowMonthHigh = showMonthHigh, ShowMonthLow = showMonthLow, MonthHighBrush = monthHighBrush, MonthLowBrush = monthLowBrush, Show4hHigh = show4hHigh, Show4hLow = show4hLow, FourHHighBrush = fourHHighBrush, FourHLowBrush = fourHLowBrush, VAMethod = vAMethod, ValueAreaPercent = valueAreaPercent, TicksPerBucket = ticksPerBucket, PdhBrush = pdhBrush, PdlBrush = pdlBrush, PvahBrush = pvahBrush, PvalBrush = pvalBrush, PdLineWidth = pdLineWidth, PvaLineWidth = pvaLineWidth, PdDashStyle = pdDashStyle, PvaDashStyle = pvaDashStyle, TdhBrush = tdhBrush, TdlBrush = tdlBrush, TpvahBrush = tpvahBrush, TpvalBrush = tpvalBrush, TdLineWidth = tdLineWidth, TpvaLineWidth = tpvaLineWidth, TdDashStyle = tdDashStyle, TpvaDashStyle = tpvaDashStyle, ShowHistoricLines = showHistoricLines, ShowPDH = showPDH, ShowPDL = showPDL, ShowPVAH = showPVAH, ShowPVAL = showPVAL, ShowTDH = showTDH, ShowTDL = showTDL, ShowTodayVABackground = showTodayVABackground, TodayVABackgroundColor = todayVABackgroundColor, ShowTPVAH = showTPVAH, ShowTPVAL = showTPVAL, ShowPOC = showPOC, ShowPrevPOC = showPrevPOC, PocBrush = pocBrush, PocLineWidth = pocLineWidth, PocDashStyle = pocDashStyle, ShowLineLabels = showLineLabels, LabelFontSize = labelFontSize, ShowIB = showIB, IBMinutes = iBMinutes, IBHighBrush = iBHighBrush, IBLowBrush = iBLowBrush, IBLineWidth = iBLineWidth, IBDashStyle = iBDashStyle, ShowIBExtensions = showIBExtensions, IBExtBrush = iBExtBrush, ShowORB = showORB, ORBMinutes = oRBMinutes, OrbHighBrush = orbHighBrush, OrbLowBrush = orbLowBrush, OrbLineWidth = orbLineWidth, OrbDashStyle = orbDashStyle, ShowAsiaORB = showAsiaORB, AsiaORBMinutes = asiaORBMinutes, AsiaOrbHighBrush = asiaOrbHighBrush, AsiaOrbLowBrush = asiaOrbLowBrush, ShowEuropeORB = showEuropeORB, EuropeORBMinutes = europeORBMinutes, EuropeOrbHighBrush = europeOrbHighBrush, EuropeOrbLowBrush = europeOrbLowBrush, ShowAsiaHighLow = showAsiaHighLow, AsiaHighBrush = asiaHighBrush, AsiaLowBrush = asiaLowBrush, ShowEuropeHighLow = showEuropeHighLow, EuropeHighBrush = europeHighBrush, EuropeLowBrush = europeLowBrush, ShowGlobexOpen = showGlobexOpen, GlobexOpenBrush = globexOpenBrush, GlobexLineWidth = globexLineWidth, GlobexDashStyle = globexDashStyle, ShowMidnightOpen = showMidnightOpen, MidnightOpenBrush = midnightOpenBrush, MidnightLineWidth = midnightLineWidth, MidnightDashStyle = midnightDashStyle, ShowNYOpenPrice = showNYOpenPrice, NYOpenPriceBrush = nYOpenPriceBrush, NYOpenPriceLineWidth = nYOpenPriceLineWidth, NYOpenPriceDashStyle = nYOpenPriceDashStyle, ShowDayOpenLine = showDayOpenLine, DayOpenLineBrush = dayOpenLineBrush, ShowAsiaOpenLine = showAsiaOpenLine, AsiaOpenLineBrush = asiaOpenLineBrush, ShowLondonOpenLine = showLondonOpenLine, LondonOpenLineBrush = londonOpenLineBrush, ShowNYOpenLine = showNYOpenLine, NYOpenLineBrush = nYOpenLineBrush, VerticalLineWidth = verticalLineWidth, VerticalLineDashStyle = verticalLineDashStyle, FixedLinesColor = fixedLinesColor, FixedLinesStep = fixedLinesStep, FixedLinesRange = fixedLinesRange, ShowFixedLines = showFixedLines }, input, ref cacheICNImportantLines);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
+{
+	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
+	{
+		public Indicators.ItCodeNerd.ICNImportantLines ICNImportantLines(bool showEma1, int ema1Period, Brush ema1Brush, bool showEma2, int ema2Period, Brush ema2Brush, bool showEma3, int ema3Period, Brush ema3Brush, bool showEma4, int ema4Period, Brush ema4Brush, int asiaStartTime, int asiaEndTime, int europeStartTime, int europeEndTime, int nYStartTime, int nYEndTime, bool showSessionVWAP, bool showAsiaVWAP, bool showEuropeVWAP, bool showNYVWAP, bool showDayHighVWAP, bool showDayLowVWAP, bool showWeeklyVWAP, bool showVwap24h, bool showPDVwapNY, bool showPDVwapSession, System.Windows.Media.Color pDVwapNYColor, System.Windows.Media.Color pDVwapSessionColor, bool showVwapBands, Brush vwap1SDBrush, Brush vwap2SDBrush, bool showPrevWeekHigh, bool showPrevWeekLow, Brush prevWeekHighBrush, Brush prevWeekLowBrush, bool showMonthHigh, bool showMonthLow, Brush monthHighBrush, Brush monthLowBrush, bool show4hHigh, bool show4hLow, Brush fourHHighBrush, Brush fourHLowBrush, ValueAreaMethod vAMethod, double valueAreaPercent, int ticksPerBucket, Brush pdhBrush, Brush pdlBrush, Brush pvahBrush, Brush pvalBrush, int pdLineWidth, int pvaLineWidth, DashStyleHelper pdDashStyle, DashStyleHelper pvaDashStyle, Brush tdhBrush, Brush tdlBrush, Brush tpvahBrush, Brush tpvalBrush, int tdLineWidth, int tpvaLineWidth, DashStyleHelper tdDashStyle, DashStyleHelper tpvaDashStyle, bool showHistoricLines, bool showPDH, bool showPDL, bool showPVAH, bool showPVAL, bool showTDH, bool showTDL, bool showTodayVABackground, System.Windows.Media.Color todayVABackgroundColor, bool showTPVAH, bool showTPVAL, bool showPOC, bool showPrevPOC, Brush pocBrush, int pocLineWidth, DashStyleHelper pocDashStyle, bool showLineLabels, int labelFontSize, bool showIB, int iBMinutes, Brush iBHighBrush, Brush iBLowBrush, int iBLineWidth, DashStyleHelper iBDashStyle, bool showIBExtensions, Brush iBExtBrush, bool showORB, int oRBMinutes, Brush orbHighBrush, Brush orbLowBrush, int orbLineWidth, DashStyleHelper orbDashStyle, bool showAsiaORB, int asiaORBMinutes, Brush asiaOrbHighBrush, Brush asiaOrbLowBrush, bool showEuropeORB, int europeORBMinutes, Brush europeOrbHighBrush, Brush europeOrbLowBrush, bool showAsiaHighLow, Brush asiaHighBrush, Brush asiaLowBrush, bool showEuropeHighLow, Brush europeHighBrush, Brush europeLowBrush, bool showGlobexOpen, Brush globexOpenBrush, int globexLineWidth, DashStyleHelper globexDashStyle, bool showMidnightOpen, Brush midnightOpenBrush, int midnightLineWidth, DashStyleHelper midnightDashStyle, bool showNYOpenPrice, Brush nYOpenPriceBrush, int nYOpenPriceLineWidth, DashStyleHelper nYOpenPriceDashStyle, bool showDayOpenLine, Brush dayOpenLineBrush, bool showAsiaOpenLine, Brush asiaOpenLineBrush, bool showLondonOpenLine, Brush londonOpenLineBrush, bool showNYOpenLine, Brush nYOpenLineBrush, int verticalLineWidth, DashStyleHelper verticalLineDashStyle, Brush fixedLinesColor, double fixedLinesStep, int fixedLinesRange, bool showFixedLines)
+		{
+			return indicator.ICNImportantLines(Input, showEma1, ema1Period, ema1Brush, showEma2, ema2Period, ema2Brush, showEma3, ema3Period, ema3Brush, showEma4, ema4Period, ema4Brush, asiaStartTime, asiaEndTime, europeStartTime, europeEndTime, nYStartTime, nYEndTime, showSessionVWAP, showAsiaVWAP, showEuropeVWAP, showNYVWAP, showDayHighVWAP, showDayLowVWAP, showWeeklyVWAP, showVwap24h, showPDVwapNY, showPDVwapSession, pDVwapNYColor, pDVwapSessionColor, showVwapBands, vwap1SDBrush, vwap2SDBrush, showPrevWeekHigh, showPrevWeekLow, prevWeekHighBrush, prevWeekLowBrush, showMonthHigh, showMonthLow, monthHighBrush, monthLowBrush, show4hHigh, show4hLow, fourHHighBrush, fourHLowBrush, vAMethod, valueAreaPercent, ticksPerBucket, pdhBrush, pdlBrush, pvahBrush, pvalBrush, pdLineWidth, pvaLineWidth, pdDashStyle, pvaDashStyle, tdhBrush, tdlBrush, tpvahBrush, tpvalBrush, tdLineWidth, tpvaLineWidth, tdDashStyle, tpvaDashStyle, showHistoricLines, showPDH, showPDL, showPVAH, showPVAL, showTDH, showTDL, showTodayVABackground, todayVABackgroundColor, showTPVAH, showTPVAL, showPOC, showPrevPOC, pocBrush, pocLineWidth, pocDashStyle, showLineLabels, labelFontSize, showIB, iBMinutes, iBHighBrush, iBLowBrush, iBLineWidth, iBDashStyle, showIBExtensions, iBExtBrush, showORB, oRBMinutes, orbHighBrush, orbLowBrush, orbLineWidth, orbDashStyle, showAsiaORB, asiaORBMinutes, asiaOrbHighBrush, asiaOrbLowBrush, showEuropeORB, europeORBMinutes, europeOrbHighBrush, europeOrbLowBrush, showAsiaHighLow, asiaHighBrush, asiaLowBrush, showEuropeHighLow, europeHighBrush, europeLowBrush, showGlobexOpen, globexOpenBrush, globexLineWidth, globexDashStyle, showMidnightOpen, midnightOpenBrush, midnightLineWidth, midnightDashStyle, showNYOpenPrice, nYOpenPriceBrush, nYOpenPriceLineWidth, nYOpenPriceDashStyle, showDayOpenLine, dayOpenLineBrush, showAsiaOpenLine, asiaOpenLineBrush, showLondonOpenLine, londonOpenLineBrush, showNYOpenLine, nYOpenLineBrush, verticalLineWidth, verticalLineDashStyle, fixedLinesColor, fixedLinesStep, fixedLinesRange, showFixedLines);
+		}
+
+		public Indicators.ItCodeNerd.ICNImportantLines ICNImportantLines(ISeries<double> input , bool showEma1, int ema1Period, Brush ema1Brush, bool showEma2, int ema2Period, Brush ema2Brush, bool showEma3, int ema3Period, Brush ema3Brush, bool showEma4, int ema4Period, Brush ema4Brush, int asiaStartTime, int asiaEndTime, int europeStartTime, int europeEndTime, int nYStartTime, int nYEndTime, bool showSessionVWAP, bool showAsiaVWAP, bool showEuropeVWAP, bool showNYVWAP, bool showDayHighVWAP, bool showDayLowVWAP, bool showWeeklyVWAP, bool showVwap24h, bool showPDVwapNY, bool showPDVwapSession, System.Windows.Media.Color pDVwapNYColor, System.Windows.Media.Color pDVwapSessionColor, bool showVwapBands, Brush vwap1SDBrush, Brush vwap2SDBrush, bool showPrevWeekHigh, bool showPrevWeekLow, Brush prevWeekHighBrush, Brush prevWeekLowBrush, bool showMonthHigh, bool showMonthLow, Brush monthHighBrush, Brush monthLowBrush, bool show4hHigh, bool show4hLow, Brush fourHHighBrush, Brush fourHLowBrush, ValueAreaMethod vAMethod, double valueAreaPercent, int ticksPerBucket, Brush pdhBrush, Brush pdlBrush, Brush pvahBrush, Brush pvalBrush, int pdLineWidth, int pvaLineWidth, DashStyleHelper pdDashStyle, DashStyleHelper pvaDashStyle, Brush tdhBrush, Brush tdlBrush, Brush tpvahBrush, Brush tpvalBrush, int tdLineWidth, int tpvaLineWidth, DashStyleHelper tdDashStyle, DashStyleHelper tpvaDashStyle, bool showHistoricLines, bool showPDH, bool showPDL, bool showPVAH, bool showPVAL, bool showTDH, bool showTDL, bool showTodayVABackground, System.Windows.Media.Color todayVABackgroundColor, bool showTPVAH, bool showTPVAL, bool showPOC, bool showPrevPOC, Brush pocBrush, int pocLineWidth, DashStyleHelper pocDashStyle, bool showLineLabels, int labelFontSize, bool showIB, int iBMinutes, Brush iBHighBrush, Brush iBLowBrush, int iBLineWidth, DashStyleHelper iBDashStyle, bool showIBExtensions, Brush iBExtBrush, bool showORB, int oRBMinutes, Brush orbHighBrush, Brush orbLowBrush, int orbLineWidth, DashStyleHelper orbDashStyle, bool showAsiaORB, int asiaORBMinutes, Brush asiaOrbHighBrush, Brush asiaOrbLowBrush, bool showEuropeORB, int europeORBMinutes, Brush europeOrbHighBrush, Brush europeOrbLowBrush, bool showAsiaHighLow, Brush asiaHighBrush, Brush asiaLowBrush, bool showEuropeHighLow, Brush europeHighBrush, Brush europeLowBrush, bool showGlobexOpen, Brush globexOpenBrush, int globexLineWidth, DashStyleHelper globexDashStyle, bool showMidnightOpen, Brush midnightOpenBrush, int midnightLineWidth, DashStyleHelper midnightDashStyle, bool showNYOpenPrice, Brush nYOpenPriceBrush, int nYOpenPriceLineWidth, DashStyleHelper nYOpenPriceDashStyle, bool showDayOpenLine, Brush dayOpenLineBrush, bool showAsiaOpenLine, Brush asiaOpenLineBrush, bool showLondonOpenLine, Brush londonOpenLineBrush, bool showNYOpenLine, Brush nYOpenLineBrush, int verticalLineWidth, DashStyleHelper verticalLineDashStyle, Brush fixedLinesColor, double fixedLinesStep, int fixedLinesRange, bool showFixedLines)
+		{
+			return indicator.ICNImportantLines(input, showEma1, ema1Period, ema1Brush, showEma2, ema2Period, ema2Brush, showEma3, ema3Period, ema3Brush, showEma4, ema4Period, ema4Brush, asiaStartTime, asiaEndTime, europeStartTime, europeEndTime, nYStartTime, nYEndTime, showSessionVWAP, showAsiaVWAP, showEuropeVWAP, showNYVWAP, showDayHighVWAP, showDayLowVWAP, showWeeklyVWAP, showVwap24h, showPDVwapNY, showPDVwapSession, pDVwapNYColor, pDVwapSessionColor, showVwapBands, vwap1SDBrush, vwap2SDBrush, showPrevWeekHigh, showPrevWeekLow, prevWeekHighBrush, prevWeekLowBrush, showMonthHigh, showMonthLow, monthHighBrush, monthLowBrush, show4hHigh, show4hLow, fourHHighBrush, fourHLowBrush, vAMethod, valueAreaPercent, ticksPerBucket, pdhBrush, pdlBrush, pvahBrush, pvalBrush, pdLineWidth, pvaLineWidth, pdDashStyle, pvaDashStyle, tdhBrush, tdlBrush, tpvahBrush, tpvalBrush, tdLineWidth, tpvaLineWidth, tdDashStyle, tpvaDashStyle, showHistoricLines, showPDH, showPDL, showPVAH, showPVAL, showTDH, showTDL, showTodayVABackground, todayVABackgroundColor, showTPVAH, showTPVAL, showPOC, showPrevPOC, pocBrush, pocLineWidth, pocDashStyle, showLineLabels, labelFontSize, showIB, iBMinutes, iBHighBrush, iBLowBrush, iBLineWidth, iBDashStyle, showIBExtensions, iBExtBrush, showORB, oRBMinutes, orbHighBrush, orbLowBrush, orbLineWidth, orbDashStyle, showAsiaORB, asiaORBMinutes, asiaOrbHighBrush, asiaOrbLowBrush, showEuropeORB, europeORBMinutes, europeOrbHighBrush, europeOrbLowBrush, showAsiaHighLow, asiaHighBrush, asiaLowBrush, showEuropeHighLow, europeHighBrush, europeLowBrush, showGlobexOpen, globexOpenBrush, globexLineWidth, globexDashStyle, showMidnightOpen, midnightOpenBrush, midnightLineWidth, midnightDashStyle, showNYOpenPrice, nYOpenPriceBrush, nYOpenPriceLineWidth, nYOpenPriceDashStyle, showDayOpenLine, dayOpenLineBrush, showAsiaOpenLine, asiaOpenLineBrush, showLondonOpenLine, londonOpenLineBrush, showNYOpenLine, nYOpenLineBrush, verticalLineWidth, verticalLineDashStyle, fixedLinesColor, fixedLinesStep, fixedLinesRange, showFixedLines);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
+	{
+		public Indicators.ItCodeNerd.ICNImportantLines ICNImportantLines(bool showEma1, int ema1Period, Brush ema1Brush, bool showEma2, int ema2Period, Brush ema2Brush, bool showEma3, int ema3Period, Brush ema3Brush, bool showEma4, int ema4Period, Brush ema4Brush, int asiaStartTime, int asiaEndTime, int europeStartTime, int europeEndTime, int nYStartTime, int nYEndTime, bool showSessionVWAP, bool showAsiaVWAP, bool showEuropeVWAP, bool showNYVWAP, bool showDayHighVWAP, bool showDayLowVWAP, bool showWeeklyVWAP, bool showVwap24h, bool showPDVwapNY, bool showPDVwapSession, System.Windows.Media.Color pDVwapNYColor, System.Windows.Media.Color pDVwapSessionColor, bool showVwapBands, Brush vwap1SDBrush, Brush vwap2SDBrush, bool showPrevWeekHigh, bool showPrevWeekLow, Brush prevWeekHighBrush, Brush prevWeekLowBrush, bool showMonthHigh, bool showMonthLow, Brush monthHighBrush, Brush monthLowBrush, bool show4hHigh, bool show4hLow, Brush fourHHighBrush, Brush fourHLowBrush, ValueAreaMethod vAMethod, double valueAreaPercent, int ticksPerBucket, Brush pdhBrush, Brush pdlBrush, Brush pvahBrush, Brush pvalBrush, int pdLineWidth, int pvaLineWidth, DashStyleHelper pdDashStyle, DashStyleHelper pvaDashStyle, Brush tdhBrush, Brush tdlBrush, Brush tpvahBrush, Brush tpvalBrush, int tdLineWidth, int tpvaLineWidth, DashStyleHelper tdDashStyle, DashStyleHelper tpvaDashStyle, bool showHistoricLines, bool showPDH, bool showPDL, bool showPVAH, bool showPVAL, bool showTDH, bool showTDL, bool showTodayVABackground, System.Windows.Media.Color todayVABackgroundColor, bool showTPVAH, bool showTPVAL, bool showPOC, bool showPrevPOC, Brush pocBrush, int pocLineWidth, DashStyleHelper pocDashStyle, bool showLineLabels, int labelFontSize, bool showIB, int iBMinutes, Brush iBHighBrush, Brush iBLowBrush, int iBLineWidth, DashStyleHelper iBDashStyle, bool showIBExtensions, Brush iBExtBrush, bool showORB, int oRBMinutes, Brush orbHighBrush, Brush orbLowBrush, int orbLineWidth, DashStyleHelper orbDashStyle, bool showAsiaORB, int asiaORBMinutes, Brush asiaOrbHighBrush, Brush asiaOrbLowBrush, bool showEuropeORB, int europeORBMinutes, Brush europeOrbHighBrush, Brush europeOrbLowBrush, bool showAsiaHighLow, Brush asiaHighBrush, Brush asiaLowBrush, bool showEuropeHighLow, Brush europeHighBrush, Brush europeLowBrush, bool showGlobexOpen, Brush globexOpenBrush, int globexLineWidth, DashStyleHelper globexDashStyle, bool showMidnightOpen, Brush midnightOpenBrush, int midnightLineWidth, DashStyleHelper midnightDashStyle, bool showNYOpenPrice, Brush nYOpenPriceBrush, int nYOpenPriceLineWidth, DashStyleHelper nYOpenPriceDashStyle, bool showDayOpenLine, Brush dayOpenLineBrush, bool showAsiaOpenLine, Brush asiaOpenLineBrush, bool showLondonOpenLine, Brush londonOpenLineBrush, bool showNYOpenLine, Brush nYOpenLineBrush, int verticalLineWidth, DashStyleHelper verticalLineDashStyle, Brush fixedLinesColor, double fixedLinesStep, int fixedLinesRange, bool showFixedLines)
+		{
+			return indicator.ICNImportantLines(Input, showEma1, ema1Period, ema1Brush, showEma2, ema2Period, ema2Brush, showEma3, ema3Period, ema3Brush, showEma4, ema4Period, ema4Brush, asiaStartTime, asiaEndTime, europeStartTime, europeEndTime, nYStartTime, nYEndTime, showSessionVWAP, showAsiaVWAP, showEuropeVWAP, showNYVWAP, showDayHighVWAP, showDayLowVWAP, showWeeklyVWAP, showVwap24h, showPDVwapNY, showPDVwapSession, pDVwapNYColor, pDVwapSessionColor, showVwapBands, vwap1SDBrush, vwap2SDBrush, showPrevWeekHigh, showPrevWeekLow, prevWeekHighBrush, prevWeekLowBrush, showMonthHigh, showMonthLow, monthHighBrush, monthLowBrush, show4hHigh, show4hLow, fourHHighBrush, fourHLowBrush, vAMethod, valueAreaPercent, ticksPerBucket, pdhBrush, pdlBrush, pvahBrush, pvalBrush, pdLineWidth, pvaLineWidth, pdDashStyle, pvaDashStyle, tdhBrush, tdlBrush, tpvahBrush, tpvalBrush, tdLineWidth, tpvaLineWidth, tdDashStyle, tpvaDashStyle, showHistoricLines, showPDH, showPDL, showPVAH, showPVAL, showTDH, showTDL, showTodayVABackground, todayVABackgroundColor, showTPVAH, showTPVAL, showPOC, showPrevPOC, pocBrush, pocLineWidth, pocDashStyle, showLineLabels, labelFontSize, showIB, iBMinutes, iBHighBrush, iBLowBrush, iBLineWidth, iBDashStyle, showIBExtensions, iBExtBrush, showORB, oRBMinutes, orbHighBrush, orbLowBrush, orbLineWidth, orbDashStyle, showAsiaORB, asiaORBMinutes, asiaOrbHighBrush, asiaOrbLowBrush, showEuropeORB, europeORBMinutes, europeOrbHighBrush, europeOrbLowBrush, showAsiaHighLow, asiaHighBrush, asiaLowBrush, showEuropeHighLow, europeHighBrush, europeLowBrush, showGlobexOpen, globexOpenBrush, globexLineWidth, globexDashStyle, showMidnightOpen, midnightOpenBrush, midnightLineWidth, midnightDashStyle, showNYOpenPrice, nYOpenPriceBrush, nYOpenPriceLineWidth, nYOpenPriceDashStyle, showDayOpenLine, dayOpenLineBrush, showAsiaOpenLine, asiaOpenLineBrush, showLondonOpenLine, londonOpenLineBrush, showNYOpenLine, nYOpenLineBrush, verticalLineWidth, verticalLineDashStyle, fixedLinesColor, fixedLinesStep, fixedLinesRange, showFixedLines);
+		}
+
+		public Indicators.ItCodeNerd.ICNImportantLines ICNImportantLines(ISeries<double> input , bool showEma1, int ema1Period, Brush ema1Brush, bool showEma2, int ema2Period, Brush ema2Brush, bool showEma3, int ema3Period, Brush ema3Brush, bool showEma4, int ema4Period, Brush ema4Brush, int asiaStartTime, int asiaEndTime, int europeStartTime, int europeEndTime, int nYStartTime, int nYEndTime, bool showSessionVWAP, bool showAsiaVWAP, bool showEuropeVWAP, bool showNYVWAP, bool showDayHighVWAP, bool showDayLowVWAP, bool showWeeklyVWAP, bool showVwap24h, bool showPDVwapNY, bool showPDVwapSession, System.Windows.Media.Color pDVwapNYColor, System.Windows.Media.Color pDVwapSessionColor, bool showVwapBands, Brush vwap1SDBrush, Brush vwap2SDBrush, bool showPrevWeekHigh, bool showPrevWeekLow, Brush prevWeekHighBrush, Brush prevWeekLowBrush, bool showMonthHigh, bool showMonthLow, Brush monthHighBrush, Brush monthLowBrush, bool show4hHigh, bool show4hLow, Brush fourHHighBrush, Brush fourHLowBrush, ValueAreaMethod vAMethod, double valueAreaPercent, int ticksPerBucket, Brush pdhBrush, Brush pdlBrush, Brush pvahBrush, Brush pvalBrush, int pdLineWidth, int pvaLineWidth, DashStyleHelper pdDashStyle, DashStyleHelper pvaDashStyle, Brush tdhBrush, Brush tdlBrush, Brush tpvahBrush, Brush tpvalBrush, int tdLineWidth, int tpvaLineWidth, DashStyleHelper tdDashStyle, DashStyleHelper tpvaDashStyle, bool showHistoricLines, bool showPDH, bool showPDL, bool showPVAH, bool showPVAL, bool showTDH, bool showTDL, bool showTodayVABackground, System.Windows.Media.Color todayVABackgroundColor, bool showTPVAH, bool showTPVAL, bool showPOC, bool showPrevPOC, Brush pocBrush, int pocLineWidth, DashStyleHelper pocDashStyle, bool showLineLabels, int labelFontSize, bool showIB, int iBMinutes, Brush iBHighBrush, Brush iBLowBrush, int iBLineWidth, DashStyleHelper iBDashStyle, bool showIBExtensions, Brush iBExtBrush, bool showORB, int oRBMinutes, Brush orbHighBrush, Brush orbLowBrush, int orbLineWidth, DashStyleHelper orbDashStyle, bool showAsiaORB, int asiaORBMinutes, Brush asiaOrbHighBrush, Brush asiaOrbLowBrush, bool showEuropeORB, int europeORBMinutes, Brush europeOrbHighBrush, Brush europeOrbLowBrush, bool showAsiaHighLow, Brush asiaHighBrush, Brush asiaLowBrush, bool showEuropeHighLow, Brush europeHighBrush, Brush europeLowBrush, bool showGlobexOpen, Brush globexOpenBrush, int globexLineWidth, DashStyleHelper globexDashStyle, bool showMidnightOpen, Brush midnightOpenBrush, int midnightLineWidth, DashStyleHelper midnightDashStyle, bool showNYOpenPrice, Brush nYOpenPriceBrush, int nYOpenPriceLineWidth, DashStyleHelper nYOpenPriceDashStyle, bool showDayOpenLine, Brush dayOpenLineBrush, bool showAsiaOpenLine, Brush asiaOpenLineBrush, bool showLondonOpenLine, Brush londonOpenLineBrush, bool showNYOpenLine, Brush nYOpenLineBrush, int verticalLineWidth, DashStyleHelper verticalLineDashStyle, Brush fixedLinesColor, double fixedLinesStep, int fixedLinesRange, bool showFixedLines)
+		{
+			return indicator.ICNImportantLines(input, showEma1, ema1Period, ema1Brush, showEma2, ema2Period, ema2Brush, showEma3, ema3Period, ema3Brush, showEma4, ema4Period, ema4Brush, asiaStartTime, asiaEndTime, europeStartTime, europeEndTime, nYStartTime, nYEndTime, showSessionVWAP, showAsiaVWAP, showEuropeVWAP, showNYVWAP, showDayHighVWAP, showDayLowVWAP, showWeeklyVWAP, showVwap24h, showPDVwapNY, showPDVwapSession, pDVwapNYColor, pDVwapSessionColor, showVwapBands, vwap1SDBrush, vwap2SDBrush, showPrevWeekHigh, showPrevWeekLow, prevWeekHighBrush, prevWeekLowBrush, showMonthHigh, showMonthLow, monthHighBrush, monthLowBrush, show4hHigh, show4hLow, fourHHighBrush, fourHLowBrush, vAMethod, valueAreaPercent, ticksPerBucket, pdhBrush, pdlBrush, pvahBrush, pvalBrush, pdLineWidth, pvaLineWidth, pdDashStyle, pvaDashStyle, tdhBrush, tdlBrush, tpvahBrush, tpvalBrush, tdLineWidth, tpvaLineWidth, tdDashStyle, tpvaDashStyle, showHistoricLines, showPDH, showPDL, showPVAH, showPVAL, showTDH, showTDL, showTodayVABackground, todayVABackgroundColor, showTPVAH, showTPVAL, showPOC, showPrevPOC, pocBrush, pocLineWidth, pocDashStyle, showLineLabels, labelFontSize, showIB, iBMinutes, iBHighBrush, iBLowBrush, iBLineWidth, iBDashStyle, showIBExtensions, iBExtBrush, showORB, oRBMinutes, orbHighBrush, orbLowBrush, orbLineWidth, orbDashStyle, showAsiaORB, asiaORBMinutes, asiaOrbHighBrush, asiaOrbLowBrush, showEuropeORB, europeORBMinutes, europeOrbHighBrush, europeOrbLowBrush, showAsiaHighLow, asiaHighBrush, asiaLowBrush, showEuropeHighLow, europeHighBrush, europeLowBrush, showGlobexOpen, globexOpenBrush, globexLineWidth, globexDashStyle, showMidnightOpen, midnightOpenBrush, midnightLineWidth, midnightDashStyle, showNYOpenPrice, nYOpenPriceBrush, nYOpenPriceLineWidth, nYOpenPriceDashStyle, showDayOpenLine, dayOpenLineBrush, showAsiaOpenLine, asiaOpenLineBrush, showLondonOpenLine, londonOpenLineBrush, showNYOpenLine, nYOpenLineBrush, verticalLineWidth, verticalLineDashStyle, fixedLinesColor, fixedLinesStep, fixedLinesRange, showFixedLines);
+		}
+	}
+}
+
+#endregion
