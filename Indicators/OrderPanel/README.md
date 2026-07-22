@@ -4,6 +4,7 @@
 
 <img width="231" height="290" alt="image" src="https://github.com/user-attachments/assets/94fda38a-4834-48c9-a97a-ca7495482c1a" />
 
+<img width="892" height="329" alt="image" src="https://github.com/user-attachments/assets/84a703f8-aed2-46a8-99a0-94148012f76f" />
 
 ## Install
 
