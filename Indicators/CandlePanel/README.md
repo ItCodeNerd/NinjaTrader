@@ -5,4 +5,4 @@ Fixed on-screen panel showing last N 5-minute, 15-minute and 1-hour candles, ind
 <img width="360" height="415" alt="image" src="https://github.com/user-attachments/assets/656c0de9-3b4d-414c-9b91-14c702514728" />
 
 
-<img width="645" height="1061" alt="image" src="https://github.com/user-attachments/assets/956abc20-830e-487b-aa53-ea8e1daf02ae" />
+<img width="320" height="580" alt="image" src="https://github.com/user-attachments/assets/956abc20-830e-487b-aa53-ea8e1daf02ae" />
