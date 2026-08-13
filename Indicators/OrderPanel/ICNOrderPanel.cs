@@ -26,15 +26,17 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 
 		// SharpDX brushes for the on-chart TP/SL lines and price tags
 		private SharpDX.Direct2D1.SolidColorBrush _entryLineBrush, _tpLineBrush, _slLineBrush;
+		private SharpDX.Direct2D1.SolidColorBrush _tpZoneBrush, _slZoneBrush;
 		private SharpDX.Direct2D1.SolidColorBrush _textBrush, _priceLabelBgBrush, _profitBrush, _lossBrush;
 		private SharpDX.DirectWrite.TextFormat _priceLabelFormat;
 		private SharpDX.Direct2D1.StrokeStyle _dashStyle;
 
 		// Drag
-		private enum DragTarget { None, TP, SL }
+		private enum DragTarget { None, Entry, TP, SL }
 		private DragTarget _dragging = DragTarget.None, _hoverLine = DragTarget.None;
-		private bool _tpUserDrag, _slUserDrag;
+		private bool _tpUserDrag, _slUserDrag, _entryUserDrag;
 		private double _tpOffset, _slOffset;
+		private double _lastSentTpPrice, _lastSentSlPrice, _lastSentEntryPrice;
 		private ChartScale _lastChartScale;
 
 		private ChartControl _chartControlRef;
@@ -46,6 +48,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		private double _lockedEntryPrice, _lockedTpPrice, _lockedSlPrice;
 
 		// Order references for cancellation
+		private Order _entryOrder;
 		private Order _tpOrder;
 		private Order _slOrder;
 		private Account _lastSubmitAccount;  // account used for order submission
@@ -109,6 +112,10 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		[NinjaScriptProperty]
 		[Display(Name = "TP/SL Units", Description = "Show and adjust TP/SL in ticks or dollars", Order = 5, GroupName = "Order Settings")]
 		public OffsetUnit TpSlUnit { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Show Risk/Reward Zones", Description = "Low-opacity red fill between entry and SL, green fill between entry and TP.", Order = 6, GroupName = "Appearance")]
+		public bool ShowRiskRewardZones { get; set; }
 
 		#endregion
 
@@ -200,6 +207,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				SlLineColor = System.Windows.Media.Brushes.Crimson;
 				PanelSide = PanelPosition.Right;
 				TpSlUnit = OffsetUnit.Ticks;
+				ShowRiskRewardZones = true;
 			}
 			else if (State == State.DataLoaded)
 			{
@@ -243,7 +251,9 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		private void UpdateTrackingPrices()
 		{
 			double ts = Instrument.MasterInstrument.TickSize;
-			double price = GetMarketPrice();
+			// Once you drag the entry line off the live price, it's pinned there — no longer
+			// chasing the market — so it submits as a Limit order instead of Market.
+			double price = _entryUserDrag ? _liveEntryPrice : GetMarketPrice();
 			_liveEntryPrice = price;
 			double tpOff = _tpUserDrag ? _tpOffset : TpTicks;
 			double slOff = _slUserDrag ? _slOffset : SlTicks;
@@ -269,14 +279,33 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			return Close[0];
 		}
 
+		// Long: at/below market = Limit (rests, fills as price falls back to it); above market =
+		// Stop (rests, triggers as price breaks up through it). Short is the mirror image. This
+		// is only meaningful once you've dragged the entry off the live price — not dragged, it's
+		// always Market (handled by the caller).
+		private OrderType ComputeEntryOrderType(bool isLong, double entryPrice)
+		{
+			double mkt = GetMarketPrice();
+			bool favorable = isLong ? (entryPrice <= mkt) : (entryPrice >= mkt);
+			return favorable ? OrderType.Limit : OrderType.StopMarket;
+		}
+
+		// Live on-chart hint for what the entry will actually submit as right now.
+		private string EntryModeLabel()
+		{
+			if (!_entryUserDrag) return "MARKET";
+			bool isL = (_state == TrackingState.TrackingLong || _state == TrackingState.LockedLong);
+			return ComputeEntryOrderType(isL, _liveEntryPrice) == OrderType.Limit ? "LIMIT" : "STOP";
+		}
+
 		private bool IsTracking { get { return _state == TrackingState.TrackingLong || _state == TrackingState.TrackingShort; } }
 		private bool IsLocked { get { return _state == TrackingState.LockedLong || _state == TrackingState.LockedShort; } }
 		private bool HasSetup { get { return _state != TrackingState.Idle; } }
 		private bool IsIdle { get { return _state == TrackingState.Idle; } }
 
-		private double ActiveEntry { get { return IsLocked ? _lockedEntryPrice : _liveEntryPrice; } }
-		private double ActiveTp { get { return IsLocked ? _lockedTpPrice : _liveTpPrice; } }
-		private double ActiveSl { get { return IsLocked ? _lockedSlPrice : _liveSlPrice; } }
+		private double ActiveEntry { get { return IsOrderWorking(_entryOrder) ? GetOrderPrice(_entryOrder) : (IsLocked ? _lockedEntryPrice : _liveEntryPrice); } }
+		private double ActiveTp { get { return IsOrderWorking(_tpOrder) ? GetOrderPrice(_tpOrder) : (IsLocked ? _lockedTpPrice : _liveTpPrice); } }
+		private double ActiveSl { get { return IsOrderWorking(_slOrder) ? GetOrderPrice(_slOrder) : (IsLocked ? _lockedSlPrice : _liveSlPrice); } }
 
 		private int TpTicksCurrent
 		{
@@ -309,13 +338,26 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 
 		#region Mouse Events (TP/SL line dragging)
 
+		// Entry is draggable pre-submit (adjusts the pending setup) AND post-submit while the
+		// entry order is still working (reprices the real resting order, same as TP/SL).
+		private bool EntryDraggable { get { return IsTracking || (IsLocked && IsOrderWorking(_entryOrder)); } }
+
 		private void OnPreviewMouseDown(object sender, MouseButtonEventArgs e)
 		{
-			if (!IsTracking || _lastChartScale == null) return;
+			if (!(IsTracking || IsLocked) || _lastChartScale == null) return;
 			System.Windows.Point pt = e.GetPosition(ChartPanel as System.Windows.IInputElement);
 			float my = (float)pt.Y;
-			float tpY = (float)_lastChartScale.GetYByValue(_liveTpPrice);
-			float slY = (float)_lastChartScale.GetYByValue(_liveSlPrice);
+			float tpY = (float)_lastChartScale.GetYByValue(ActiveTp);
+			float slY = (float)_lastChartScale.GetYByValue(ActiveSl);
+			if (EntryDraggable)
+			{
+				float eY = (float)_lastChartScale.GetYByValue(ActiveEntry);
+				if (Math.Abs(my - eY) <= LineHitZone)
+				{
+					Print("ICNOrderPanel DEBUG: MouseDown hit Entry line, my=" + my + " eY=" + eY);
+					_dragging = DragTarget.Entry; ApplyDrag(my); ChartPanel.CaptureMouse(); e.Handled = true; _chartControlRef?.InvalidateVisual(); return;
+				}
+			}
 			if (Math.Abs(my - tpY) <= LineHitZone) { _dragging = DragTarget.TP; ApplyDrag(my); ChartPanel.CaptureMouse(); e.Handled = true; _chartControlRef?.InvalidateVisual(); return; }
 			if (Math.Abs(my - slY) <= LineHitZone) { _dragging = DragTarget.SL; ApplyDrag(my); ChartPanel.CaptureMouse(); e.Handled = true; _chartControlRef?.InvalidateVisual(); return; }
 		}
@@ -330,16 +372,17 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			System.Windows.Point pt = e.GetPosition(ChartPanel as System.Windows.IInputElement);
 			float my = (float)pt.Y;
 
-			if (_dragging != DragTarget.None && IsTracking && _lastChartScale != null)
+			if (_dragging != DragTarget.None && (IsTracking || IsLocked) && _lastChartScale != null)
 			{ ApplyDrag(my); e.Handled = true; _chartControlRef?.InvalidateVisual(); return; }
 
 			// Line hover + cursor
 			DragTarget newHL = DragTarget.None;
-			if (IsTracking && _lastChartScale != null)
+			if ((IsTracking || IsLocked) && _lastChartScale != null)
 			{
-				float tpY = (float)_lastChartScale.GetYByValue(_liveTpPrice);
-				float slY = (float)_lastChartScale.GetYByValue(_liveSlPrice);
-				if (Math.Abs(my - tpY) <= LineHitZone) newHL = DragTarget.TP;
+				float tpY = (float)_lastChartScale.GetYByValue(ActiveTp);
+				float slY = (float)_lastChartScale.GetYByValue(ActiveSl);
+				if (EntryDraggable && Math.Abs(my - (float)_lastChartScale.GetYByValue(ActiveEntry)) <= LineHitZone) newHL = DragTarget.Entry;
+				else if (Math.Abs(my - tpY) <= LineHitZone) newHL = DragTarget.TP;
 				else if (Math.Abs(my - slY) <= LineHitZone) newHL = DragTarget.SL;
 			}
 			if (newHL != _hoverLine)
@@ -356,8 +399,72 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			double dragPrice = _lastChartScale.GetValueByY(mouseY);
 			double ts = Instrument.MasterInstrument.TickSize;
 			dragPrice = Math.Round(dragPrice / ts) * ts;
-			if (_dragging == DragTarget.TP) { _liveTpPrice = dragPrice; _tpOffset = Math.Abs(dragPrice - _liveEntryPrice) / ts; _tpUserDrag = true; }
-			else if (_dragging == DragTarget.SL) { _liveSlPrice = dragPrice; _slOffset = Math.Abs(dragPrice - _liveEntryPrice) / ts; _slUserDrag = true; }
+			if (_dragging == DragTarget.Entry && IsTracking)
+			{
+				_liveEntryPrice = dragPrice;
+				_entryUserDrag = true;
+				// Re-anchor TP/SL off the new entry immediately, instead of waiting for the next tick.
+				double tpOff = _tpUserDrag ? _tpOffset : TpTicks;
+				double slOff = _slUserDrag ? _slOffset : SlTicks;
+				if (_state == TrackingState.TrackingLong)
+				{ _liveTpPrice = _liveEntryPrice + tpOff * ts; _liveSlPrice = _liveEntryPrice - slOff * ts; }
+				else
+				{ _liveTpPrice = _liveEntryPrice - tpOff * ts; _liveSlPrice = _liveEntryPrice + slOff * ts; }
+			}
+			else if (_dragging == DragTarget.Entry && IsLocked)
+			{
+				// Post-submit: TP/SL are already independently set — moving the entry here only
+				// reprices the real resting entry order, it doesn't drag TP/SL along with it.
+				_lockedEntryPrice = dragPrice;
+				Print("ICNOrderPanel DEBUG: ApplyDrag Entry/Locked dragPrice=" + dragPrice + " lastSent=" + _lastSentEntryPrice
+					+ " entryOrder=" + (_entryOrder == null ? "null" : _entryOrder.OrderState.ToString() + "/" + _entryOrder.OrderType));
+				if (IsOrderWorking(_entryOrder) && dragPrice != _lastSentEntryPrice)
+				{ ChangeEntryOrderPrice(dragPrice); _lastSentEntryPrice = dragPrice; }
+			}
+			else if (_dragging == DragTarget.TP)
+			{
+				_liveTpPrice = dragPrice; _lockedTpPrice = dragPrice;
+				_tpOffset = Math.Abs(dragPrice - _liveEntryPrice) / ts; _tpUserDrag = true;
+				// Pre-fill: nothing live to reprice yet — this value is picked up when the bracket
+				// submits on fill. Post-fill: the real order exists, so reprice it live.
+				if (IsOrderWorking(_tpOrder) && dragPrice != _lastSentTpPrice)
+				{ ChangeExitOrderPrice(_tpOrder, dragPrice, true); _lastSentTpPrice = dragPrice; }
+			}
+			else if (_dragging == DragTarget.SL)
+			{
+				_liveSlPrice = dragPrice; _lockedSlPrice = dragPrice;
+				_slOffset = Math.Abs(dragPrice - _liveEntryPrice) / ts; _slUserDrag = true;
+				if (IsOrderWorking(_slOrder) && dragPrice != _lastSentSlPrice)
+				{ ChangeExitOrderPrice(_slOrder, dragPrice, false); _lastSentSlPrice = dragPrice; }
+			}
+		}
+
+		// Reprices the live working entry order in place as you drag it. Its OrderType (Limit vs
+		// Stop) was fixed at submission time — dragging only ever moves the price, never flips type.
+		private void ChangeEntryOrderPrice(double newPrice)
+		{
+			try
+			{
+				if (_lastSubmitAccount == null || !IsOrderWorking(_entryOrder)) return;
+				if (_entryOrder.OrderType == OrderType.Limit) _entryOrder.LimitPrice = newPrice;
+				else if (_entryOrder.OrderType == OrderType.StopMarket) _entryOrder.StopPrice = newPrice;
+				else { Print("ICNOrderPanel DEBUG: ChangeEntryOrderPrice — unhandled OrderType " + _entryOrder.OrderType); return; }
+				_lastSubmitAccount.Change(new[] { _entryOrder });
+				Print("ICNOrderPanel DEBUG: ChangeEntryOrderPrice sent — newPrice=" + newPrice + " GetOrderPrice now=" + GetOrderPrice(_entryOrder));
+			}
+			catch (Exception ex) { Print("ICNOrderPanel: ChangeEntryOrderPrice error — " + ex.Message); }
+		}
+
+		// Reprices a live working TP (Limit) or SL (StopMarket) order in place as you drag it.
+		private void ChangeExitOrderPrice(Order order, double newPrice, bool isLimitOrder)
+		{
+			try
+			{
+				if (_lastSubmitAccount == null || order == null || !IsOrderWorking(order)) return;
+				if (isLimitOrder) order.LimitPrice = newPrice; else order.StopPrice = newPrice;
+				_lastSubmitAccount.Change(new[] { order });
+			}
+			catch (Exception ex) { Print("ICNOrderPanel: ChangeExitOrderPrice error — " + ex.Message); }
 		}
 
 		#endregion
@@ -370,8 +477,9 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			_lockedEntryPrice = _liveEntryPrice; _lockedTpPrice = _liveTpPrice; _lockedSlPrice = _liveSlPrice;
 			_state = (_state == TrackingState.TrackingLong) ? TrackingState.LockedLong : TrackingState.LockedShort;
 			ChartPanel.Cursor = System.Windows.Input.Cursors.Arrow;
-			// Only the entry line is drawn; the broker's own TP/SL order lines render the bracket.
-			Draw.HorizontalLine(this, "ICNPanel_Entry", _lockedEntryPrice, EntryLineColor, DashStyleHelper.Solid, 2);
+			// The entry line + its ticks/$ decoration is drawn by DrawEntryDecoration in OnRender
+			// (while the entry order is still working); the broker's own TP/SL order lines render
+			// the bracket once filled.
 			SubmitOrders();
 		}
 
@@ -388,11 +496,20 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				bool isL = (_state == TrackingState.LockedLong);
 				OrderAction ent = isL ? OrderAction.Buy : OrderAction.Sell;
 				OrderAction ext = isL ? OrderAction.Sell : OrderAction.Buy;
-				var entO = acct.CreateOrder(Instrument, ent, OrderType.Market, OrderEntry.Manual, TimeInForce.Day, OrderQuantity, 0, 0, string.Empty, "ICNPanel_Entry", Core.Globals.MaxDate, null);
-				_ocoId = Guid.NewGuid().ToString("N").Substring(0, 16);
-				_tpOrder = acct.CreateOrder(Instrument, ext, OrderType.Limit, OrderEntry.Manual, TimeInForce.Day, OrderQuantity, _lockedTpPrice, 0, _ocoId, "ICNPanel_TP", Core.Globals.MaxDate, null);
-				_slOrder = acct.CreateOrder(Instrument, ext, OrderType.StopMarket, OrderEntry.Manual, TimeInForce.Day, OrderQuantity, 0, _lockedSlPrice, _ocoId, "ICNPanel_SL", Core.Globals.MaxDate, null);
-				acct.Submit(new[] { entO, _tpOrder, _slOrder });
+				// Left untouched, entry is Market at whatever price is current on click. Dragged,
+				// it's Limit on the favorable side (rests, fills as price comes back to it) or
+				// Stop on the unfavorable side (rests, triggers as price breaks through it) — same
+				// "smart" side-of-price order-type pick every drag-to-order chart tool uses, so a
+				// limit never fires the instant you place it just because you dragged through the market.
+				OrderType entryType = ComputeEntryOrderType(isL, _lockedEntryPrice);
+				double entryLimitPrice = entryType == OrderType.Limit ? _lockedEntryPrice : 0;
+				double entryStopPrice = entryType == OrderType.StopMarket ? _lockedEntryPrice : 0;
+				var entO = acct.CreateOrder(Instrument, ent, entryType, OrderEntry.Manual, TimeInForce.Day, OrderQuantity, entryLimitPrice, entryStopPrice, string.Empty, "ICNPanel_Entry", Core.Globals.MaxDate, null);
+				_entryOrder = entO;
+				// TP/SL are NOT submitted here — a resting Limit/Stop entry has no position yet, so
+				// exit orders would just sit live on the account with nothing to exit. They're built
+				// and submitted as an OCO pair only once OnAccountExecutionUpdate sees the entry fill.
+				acct.Submit(new[] { entO });
 				_orderSubmitted = true;
 			}
 			catch (Exception ex) { Print("ICNOrderPanel: " + ex.Message); }
@@ -409,6 +526,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			_subscribedAccount = acct;
 			_subscribedAccount.PositionUpdate += OnAccountPositionUpdate;
 			_subscribedAccount.OrderUpdate += OnAccountOrderUpdate;
+			_subscribedAccount.ExecutionUpdate += OnAccountExecutionUpdate;
 		}
 
 		private void UnsubscribeAccount()
@@ -416,7 +534,32 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			if (_subscribedAccount == null) return;
 			_subscribedAccount.PositionUpdate -= OnAccountPositionUpdate;
 			_subscribedAccount.OrderUpdate -= OnAccountOrderUpdate;
+			_subscribedAccount.ExecutionUpdate -= OnAccountExecutionUpdate;
 			_subscribedAccount = null;
+		}
+
+		// Fires the TP/SL OCO bracket the moment the entry order fully fills — not before, so no
+		// exit order is ever live on the account without a position behind it.
+		private void OnAccountExecutionUpdate(object sender, ExecutionEventArgs e)
+		{
+			try
+			{
+				if (!IsLocked || _entryOrder == null || e == null || e.Execution == null) return;
+				if (e.Execution.Order != _entryOrder || _entryOrder.OrderState != OrderState.Filled) return;
+				if (_tpOrder != null || _slOrder != null) return; // bracket already sent — guard duplicate fills/events
+
+				bool isL = (_state == TrackingState.LockedLong);
+				OrderAction ext = isL ? OrderAction.Sell : OrderAction.Buy;
+				int filledQty = _entryOrder.Filled > 0 ? _entryOrder.Filled : OrderQuantity;
+
+				_ocoId = Guid.NewGuid().ToString("N").Substring(0, 16);
+				_tpOrder = _lastSubmitAccount.CreateOrder(Instrument, ext, OrderType.Limit, OrderEntry.Manual, TimeInForce.Day, filledQty, _lockedTpPrice, 0, _ocoId, "ICNPanel_TP", Core.Globals.MaxDate, null);
+				_slOrder = _lastSubmitAccount.CreateOrder(Instrument, ext, OrderType.StopMarket, OrderEntry.Manual, TimeInForce.Day, filledQty, 0, _lockedSlPrice, _ocoId, "ICNPanel_SL", Core.Globals.MaxDate, null);
+				_lastSubmitAccount.Submit(new[] { _tpOrder, _slOrder });
+
+				_chartControlRef?.Dispatcher.InvokeAsync(() => { RefreshPanel(); _chartControlRef?.InvalidateVisual(); });
+			}
+			catch (Exception ex) { Print("ICNOrderPanel: bracket submit error — " + ex.Message); }
 		}
 
 		// Fired when a position changes on the submission account. If our instrument
@@ -469,13 +612,14 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			// Never leave live orders behind: cancel anything still working before
 			// dropping the references (entry rejected, position flat, user cancel).
 			// CancelOrderSafe checks OrderState, so already-cancelled/filled orders are no-ops.
-			CancelOrderSafe(_tpOrder); CancelOrderSafe(_slOrder);
+			CancelOrderSafe(_entryOrder); CancelOrderSafe(_tpOrder); CancelOrderSafe(_slOrder);
 			RemoveDrawObject("ICNPanel_Entry"); RemoveDrawObject("ICNPanel_TP"); RemoveDrawObject("ICNPanel_SL");
 			_state = TrackingState.Idle; _dragging = DragTarget.None; _hoverLine = DragTarget.None;
-			_tpUserDrag = false; _slUserDrag = false;
+			_tpUserDrag = false; _slUserDrag = false; _entryUserDrag = false;
 			_liveEntryPrice = _liveTpPrice = _liveSlPrice = 0;
 			_lockedEntryPrice = _lockedTpPrice = _lockedSlPrice = 0;
-			_tpOrder = null; _slOrder = null; _lastSubmitAccount = null;
+			_lastSentTpPrice = _lastSentSlPrice = _lastSentEntryPrice = 0;
+			_entryOrder = null; _tpOrder = null; _slOrder = null; _lastSubmitAccount = null;
 			_orderSubmitted = false; _ocoId = null;
 			UnsubscribeAccount();
 			if (ChartPanel != null) ChartPanel.Cursor = System.Windows.Input.Cursors.Arrow;
@@ -796,7 +940,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			foreach (var b in _spinButtons) b.Opacity = b.IsEnabled ? 1.0 : 0.4;
 
 			_statusText.Text = idle ? "Idle — set ticks & qty"
-				: tracking ? ("TRACKING " + (_state == TrackingState.TrackingLong ? "LONG" : "SHORT") + " — drag TP/SL")
+				: tracking ? ("TRACKING " + (_state == TrackingState.TrackingLong ? "LONG" : "SHORT") + " — drag Entry/TP/SL (" + EntryModeLabel() + ")")
 				: "ORDER PLACED";
 
 			_acctText.Text = "Acct: " + (_lastAccountName.Length > 0 ? _lastAccountName : "(none)");
@@ -851,14 +995,14 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		private void OnBuyClick()
 		{
 			if (HasSetup) return;
-			_state = TrackingState.TrackingLong; _tpUserDrag = false; _slUserDrag = false;
+			_state = TrackingState.TrackingLong; _tpUserDrag = false; _slUserDrag = false; _entryUserDrag = false;
 			UpdateTrackingPrices(); RefreshPanel(); _chartControlRef?.InvalidateVisual();
 		}
 
 		private void OnSellClick()
 		{
 			if (HasSetup) return;
-			_state = TrackingState.TrackingShort; _tpUserDrag = false; _slUserDrag = false;
+			_state = TrackingState.TrackingShort; _tpUserDrag = false; _slUserDrag = false; _entryUserDrag = false;
 			UpdateTrackingPrices(); RefreshPanel(); _chartControlRef?.InvalidateVisual();
 		}
 
@@ -898,18 +1042,69 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				_wpfPanel.Dispatcher.InvokeAsync(RefreshPanel);
 			}
 			if (IsTracking) DrawTrackingLines(rt, chartScale);
+			else if (IsLocked) { DrawEntryDecoration(rt, chartScale); DrawLockedExitLines(rt, chartScale); }
 		}
 
-		private void DrawTrackingLines(RenderTarget rt, ChartScale cs)
+		private static bool IsOrderWorking(Order o) =>
+			o != null && (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted || o.OrderState == OrderState.Submitted);
+
+		// The order's actual resting price — whichever field its OrderType uses. Reading this
+		// (instead of our own cached fields) is what makes the labels track the real order no
+		// matter how its price changed (our drag, NT8's native order-line drag, manual edit, etc).
+		private static double GetOrderPrice(Order o)
+		{
+			if (o == null) return 0;
+			if (o.OrderType == OrderType.Limit || o.OrderType == OrderType.StopLimit) return o.LimitPrice;
+			if (o.OrderType == OrderType.StopMarket || o.OrderType == OrderType.MIT) return o.StopPrice;
+			return 0;
+		}
+
+		// OrderLineDecorator (the separate Gemify indicator) only decorates exit orders once a
+		// position already exists — a resting entry order never gets ticks/$ shown on it. This
+		// fills that gap, in the same visual style, for as long as the entry order is still working.
+		// Entry line + decoration, shown for the whole Locked phase while the entry order is still
+		// working. Reads ActiveEntry (the real order price when one exists) so it always tracks
+		// truth regardless of how the price changed — our drag, NT8's native line, anything.
+		private void DrawEntryDecoration(RenderTarget rt, ChartScale cs)
+		{
+			if (!IsOrderWorking(_entryOrder) || Instrument == null) return;
+
+			double ts = Instrument.MasterInstrument.TickSize;
+			double entryPrice = ActiveEntry;
+			double mkt = GetMarketPrice();
+			int ticks = ts > 0 ? (int)Math.Round(Math.Abs(entryPrice - mkt) / ts) : 0;
+			double dollars = TicksToDollars(ticks) * OrderQuantity;
+			string typeLabel = _entryOrder.OrderType == OrderType.Limit ? "LMT" : _entryOrder.OrderType == OrderType.StopMarket ? "STP" : _entryOrder.OrderType.ToString();
+
+			float L = (float)ChartPanel.X, R = (float)(ChartPanel.X + ChartPanel.W);
+			float y = (float)cs.GetYByValue(entryPrice);
+			bool eA = _hoverLine == DragTarget.Entry || _dragging == DragTarget.Entry;
+			rt.DrawLine(new Vector2(L, y), new Vector2(R, y), _entryLineBrush, eA ? 3f : 2f);
+			if (eA) DrawGrip(rt, R - 40, y, _entryLineBrush);
+
+			string text = FormatPrice(entryPrice) + "  ENTRY " + typeLabel + " (" + OrderQuantity + ")  " + ticks + "T  " + FmtDollars(dollars);
+			DrawPriceTag(rt, R - 25, y, text, _entryLineBrush, _textBrush);
+		}
+
+		// Draggable TP/SL, shown for the whole Locked phase: before fill these are pending targets
+		// (no live order yet — ApplyDrag only updates _lockedTpPrice/_lockedSlPrice); after fill
+		// they're the actual working orders, and ActiveTp/ActiveSl read the real order price so
+		// this always tracks truth, and dragging reprices them live via Account.Change.
+		private void DrawLockedExitLines(RenderTarget rt, ChartScale cs)
 		{
 			float L = (float)ChartPanel.X, R = (float)(ChartPanel.X + ChartPanel.W);
-			float eY = (float)cs.GetYByValue(_liveEntryPrice);
-			float tY = (float)cs.GetYByValue(_liveTpPrice);
-			float sY = (float)cs.GetYByValue(_liveSlPrice);
+			float eY = (float)cs.GetYByValue(ActiveEntry);
+			float tY = (float)cs.GetYByValue(ActiveTp);
+			float sY = (float)cs.GetYByValue(ActiveSl);
 			bool tA = _hoverLine == DragTarget.TP || _dragging == DragTarget.TP;
 			bool sA = _hoverLine == DragTarget.SL || _dragging == DragTarget.SL;
 
-			rt.DrawLine(new Vector2(L, eY), new Vector2(R, eY), _entryLineBrush, 2f);
+			if (ShowRiskRewardZones)
+			{
+				DrawZone(rt, L, R, eY, tY, _tpZoneBrush);
+				DrawZone(rt, L, R, eY, sY, _slZoneBrush);
+			}
+
 			rt.DrawLine(new Vector2(L, tY), new Vector2(R, tY), _tpLineBrush, tA ? 3f : 2f, _dashStyle);
 			rt.DrawLine(new Vector2(L, sY), new Vector2(R, sY), _slLineBrush, sA ? 3f : 2f, _dashStyle);
 
@@ -919,11 +1114,47 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 
 			double tpPnl = TicksToDollars(TpTicksCurrent) * OrderQuantity;
 			double slPnl = TicksToDollars(SlTicksCurrent) * OrderQuantity;
+			string tpStatus = IsOrderWorking(_tpOrder) ? "" : "  (pending fill)";
+			string slStatus = IsOrderWorking(_slOrder) ? "" : "  (pending fill)";
 
 			float anc = R - 25;
-			DrawPriceTag(rt, anc, eY, FormatPrice(_liveEntryPrice), _entryLineBrush, _textBrush);
-			DrawPriceTag(rt, anc, tY, FormatPrice(_liveTpPrice) + "  TP " + TpTicksCurrent + "t  " + FmtDollars(tpPnl), _tpLineBrush, _profitBrush);
-			DrawPriceTag(rt, anc, sY, FormatPrice(_liveSlPrice) + "  SL " + SlTicksCurrent + "t  " + FmtDollars(-slPnl), _slLineBrush, _lossBrush);
+			DrawPriceTag(rt, anc, tY, FormatPrice(ActiveTp) + "  TP " + TpTicksCurrent + "t  " + FmtDollars(tpPnl) + tpStatus, _tpLineBrush, _profitBrush);
+			DrawPriceTag(rt, anc, sY, FormatPrice(ActiveSl) + "  SL " + SlTicksCurrent + "t  " + FmtDollars(-slPnl) + slStatus, _slLineBrush, _lossBrush);
+		}
+
+		private void DrawTrackingLines(RenderTarget rt, ChartScale cs)
+		{
+			float L = (float)ChartPanel.X, R = (float)(ChartPanel.X + ChartPanel.W);
+			float eY = (float)cs.GetYByValue(ActiveEntry);
+			float tY = (float)cs.GetYByValue(ActiveTp);
+			float sY = (float)cs.GetYByValue(ActiveSl);
+			bool eA = _hoverLine == DragTarget.Entry || _dragging == DragTarget.Entry;
+			bool tA = _hoverLine == DragTarget.TP || _dragging == DragTarget.TP;
+			bool sA = _hoverLine == DragTarget.SL || _dragging == DragTarget.SL;
+
+			if (ShowRiskRewardZones)
+			{
+				DrawZone(rt, L, R, eY, tY, _tpZoneBrush);
+				DrawZone(rt, L, R, eY, sY, _slZoneBrush);
+			}
+
+			rt.DrawLine(new Vector2(L, eY), new Vector2(R, eY), _entryLineBrush, eA ? 3f : 2f);
+			rt.DrawLine(new Vector2(L, tY), new Vector2(R, tY), _tpLineBrush, tA ? 3f : 2f, _dashStyle);
+			rt.DrawLine(new Vector2(L, sY), new Vector2(R, sY), _slLineBrush, sA ? 3f : 2f, _dashStyle);
+
+			float gripX = R - 40;
+			if (eA) DrawGrip(rt, gripX, eY, _entryLineBrush);
+			if (tA) DrawGrip(rt, gripX, tY, _tpLineBrush);
+			if (sA) DrawGrip(rt, gripX, sY, _slLineBrush);
+
+			double tpPnl = TicksToDollars(TpTicksCurrent) * OrderQuantity;
+			double slPnl = TicksToDollars(SlTicksCurrent) * OrderQuantity;
+
+			float anc = R - 25;
+			string entryTag = FormatPrice(ActiveEntry) + "  " + EntryModeLabel();
+			DrawPriceTag(rt, anc, eY, entryTag, _entryLineBrush, _textBrush);
+			DrawPriceTag(rt, anc, tY, FormatPrice(ActiveTp) + "  TP " + TpTicksCurrent + "t  " + FmtDollars(tpPnl), _tpLineBrush, _profitBrush);
+			DrawPriceTag(rt, anc, sY, FormatPrice(ActiveSl) + "  SL " + SlTicksCurrent + "t  " + FmtDollars(-slPnl), _slLineBrush, _lossBrush);
 		}
 
 		private void DrawGrip(RenderTarget rt, float cx, float cy, SharpDX.Direct2D1.SolidColorBrush b)
@@ -931,9 +1162,17 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			for (int i = -1; i <= 1; i++) { float y = cy + i * 3f; rt.DrawLine(new Vector2(cx - 5, y), new Vector2(cx + 5, y), b, 1.5f); }
 		}
 
+		// Low-opacity band spanning entry<->yOther, e.g. entry-to-SL (red) or entry-to-TP (green).
+		private void DrawZone(RenderTarget rt, float L, float R, float yEntry, float yOther, SharpDX.Direct2D1.SolidColorBrush fill)
+		{
+			float top = Math.Min(yEntry, yOther), bottom = Math.Max(yEntry, yOther);
+			if (bottom - top < 1f) return;
+			rt.FillRectangle(new SharpDX.RectangleF(L, top, R - L, bottom - top), fill);
+		}
+
 		private void DrawPriceTag(RenderTarget rt, float rAnc, float y, string txt, SharpDX.Direct2D1.SolidColorBrush border, SharpDX.Direct2D1.SolidColorBrush fg)
 		{
-			float w = 220f, h = 18f, x = rAnc - w, ly = y - h / 2f;
+			float w = 280f, h = 18f, x = rAnc - w, ly = y - h / 2f;
 			var r = new SharpDX.RectangleF(x, ly, w, h);
 			var rr = new RoundedRectangle { Rect = r, RadiusX = 3f, RadiusY = 3f };
 			rt.FillRoundedRectangle(rr, _priceLabelBgBrush);
@@ -955,6 +1194,8 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			_entryLineBrush = new SharpDX.Direct2D1.SolidColorBrush(rt, new Color4(0.12f, 0.56f, 1.00f, 1f));
 			_tpLineBrush = new SharpDX.Direct2D1.SolidColorBrush(rt, new Color4(0.20f, 0.80f, 0.20f, 1f));
 			_slLineBrush = new SharpDX.Direct2D1.SolidColorBrush(rt, new Color4(0.86f, 0.08f, 0.24f, 1f));
+			_tpZoneBrush = new SharpDX.Direct2D1.SolidColorBrush(rt, new Color4(0.20f, 0.80f, 0.20f, 0.12f));
+			_slZoneBrush = new SharpDX.Direct2D1.SolidColorBrush(rt, new Color4(0.86f, 0.08f, 0.24f, 0.12f));
 			_dashStyle = new StrokeStyle(rt.Factory, new StrokeStyleProperties { DashStyle = SharpDX.Direct2D1.DashStyle.Dash });
 
 			var dw = Core.Globals.DirectWriteFactory;
@@ -971,6 +1212,8 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			_entryLineBrush?.Dispose(); _entryLineBrush = null;
 			_tpLineBrush?.Dispose(); _tpLineBrush = null;
 			_slLineBrush?.Dispose(); _slLineBrush = null;
+			_tpZoneBrush?.Dispose(); _tpZoneBrush = null;
+			_slZoneBrush?.Dispose(); _slZoneBrush = null;
 			_dashStyle?.Dispose(); _dashStyle = null;
 			_priceLabelFormat?.Dispose(); _priceLabelFormat = null;
 		}
@@ -984,60 +1227,3 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		#endregion
 	}
 }
-
-#region NinjaScript generated code. Neither change nor remove.
-
-namespace NinjaTrader.NinjaScript.Indicators
-{
-	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
-	{
-		private ItCodeNerd.ICNOrderPanel[] cacheICNOrderPanel;
-		public ItCodeNerd.ICNOrderPanel ICNOrderPanel(int tpTicks, int slTicks, int orderQuantity, System.Windows.Media.Brush entryLineColor, System.Windows.Media.Brush tpLineColor, System.Windows.Media.Brush slLineColor, PanelPosition panelSide, OffsetUnit tpSlUnit)
-		{
-			return ICNOrderPanel(Input, tpTicks, slTicks, orderQuantity, entryLineColor, tpLineColor, slLineColor, panelSide, tpSlUnit);
-		}
-
-		public ItCodeNerd.ICNOrderPanel ICNOrderPanel(ISeries<double> input, int tpTicks, int slTicks, int orderQuantity, System.Windows.Media.Brush entryLineColor, System.Windows.Media.Brush tpLineColor, System.Windows.Media.Brush slLineColor, PanelPosition panelSide, OffsetUnit tpSlUnit)
-		{
-			if (cacheICNOrderPanel != null)
-				for (int idx = 0; idx < cacheICNOrderPanel.Length; idx++)
-					if (cacheICNOrderPanel[idx] != null && cacheICNOrderPanel[idx].TpTicks == tpTicks && cacheICNOrderPanel[idx].SlTicks == slTicks && cacheICNOrderPanel[idx].OrderQuantity == orderQuantity && cacheICNOrderPanel[idx].EntryLineColor == entryLineColor && cacheICNOrderPanel[idx].TpLineColor == tpLineColor && cacheICNOrderPanel[idx].SlLineColor == slLineColor && cacheICNOrderPanel[idx].PanelSide == panelSide && cacheICNOrderPanel[idx].TpSlUnit == tpSlUnit && cacheICNOrderPanel[idx].EqualsInput(input))
-						return cacheICNOrderPanel[idx];
-			return CacheIndicator<ItCodeNerd.ICNOrderPanel>(new ItCodeNerd.ICNOrderPanel(){ TpTicks = tpTicks, SlTicks = slTicks, OrderQuantity = orderQuantity, EntryLineColor = entryLineColor, TpLineColor = tpLineColor, SlLineColor = slLineColor, PanelSide = panelSide, TpSlUnit = tpSlUnit }, input, ref cacheICNOrderPanel);
-		}
-	}
-}
-
-namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
-{
-	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
-	{
-		public Indicators.ItCodeNerd.ICNOrderPanel ICNOrderPanel(int tpTicks, int slTicks, int orderQuantity, System.Windows.Media.Brush entryLineColor, System.Windows.Media.Brush tpLineColor, System.Windows.Media.Brush slLineColor, PanelPosition panelSide, OffsetUnit tpSlUnit)
-		{
-			return indicator.ICNOrderPanel(Input, tpTicks, slTicks, orderQuantity, entryLineColor, tpLineColor, slLineColor, panelSide, tpSlUnit);
-		}
-
-		public Indicators.ItCodeNerd.ICNOrderPanel ICNOrderPanel(ISeries<double> input , int tpTicks, int slTicks, int orderQuantity, System.Windows.Media.Brush entryLineColor, System.Windows.Media.Brush tpLineColor, System.Windows.Media.Brush slLineColor, PanelPosition panelSide, OffsetUnit tpSlUnit)
-		{
-			return indicator.ICNOrderPanel(input, tpTicks, slTicks, orderQuantity, entryLineColor, tpLineColor, slLineColor, panelSide, tpSlUnit);
-		}
-	}
-}
-
-namespace NinjaTrader.NinjaScript.Strategies
-{
-	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
-	{
-		public Indicators.ItCodeNerd.ICNOrderPanel ICNOrderPanel(int tpTicks, int slTicks, int orderQuantity, System.Windows.Media.Brush entryLineColor, System.Windows.Media.Brush tpLineColor, System.Windows.Media.Brush slLineColor, PanelPosition panelSide, OffsetUnit tpSlUnit)
-		{
-			return indicator.ICNOrderPanel(Input, tpTicks, slTicks, orderQuantity, entryLineColor, tpLineColor, slLineColor, panelSide, tpSlUnit);
-		}
-
-		public Indicators.ItCodeNerd.ICNOrderPanel ICNOrderPanel(ISeries<double> input , int tpTicks, int slTicks, int orderQuantity, System.Windows.Media.Brush entryLineColor, System.Windows.Media.Brush tpLineColor, System.Windows.Media.Brush slLineColor, PanelPosition panelSide, OffsetUnit tpSlUnit)
-		{
-			return indicator.ICNOrderPanel(input, tpTicks, slTicks, orderQuantity, entryLineColor, tpLineColor, slLineColor, panelSide, tpSlUnit);
-		}
-	}
-}
-
-#endregion
