@@ -47,9 +47,11 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 	{
 		private struct Candle
 		{
-			public double Open, High, Low, Close;
+			public double Open, High, Low, Close, Volume;
 			public DateTime Time;
 		}
+
+		private enum Bias { Bullish, Bearish, Mixed }
 
 		// SharpDX resources (created/disposed in OnRenderTargetChanged)
 		private Brush upBrush;
@@ -60,6 +62,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		private Brush borderBrush;
 		private Brush currentPriceBrush;
 		private TextFormat labelFormat;
+		private TextFormat countdownFormat;
 
 		protected override void OnStateChange()
 		{
@@ -94,13 +97,21 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				TextColorBrush = System.Windows.Media.Brushes.White;
 				ShowCurrentPriceLine = true;
 				CurrentPriceLineBrush = System.Windows.Media.Brushes.Yellow;
+
+				ShowTimeRemaining = true;
+				ShowBiasLabel = true;
 			}
 			else if (State == State.Configure)
 			{
-				// Add the three fixed higher-timeframe series regardless of the chart's own period
-				AddDataSeries(BarsPeriodType.Minute, 5);   // BarsArray[1]
-				AddDataSeries(BarsPeriodType.Minute, 15);  // BarsArray[2]
-				AddDataSeries(BarsPeriodType.Minute, 60);  // BarsArray[3]
+				// Add the three fixed higher-timeframe series regardless of the chart's own period.
+				// Tick Replay is enabled only on these panel series (not the chart's primary series)
+				// so the shown candles form/update intrabar instead of only on bar close.
+				// barsToLoad is capped to ~1 trading day per timeframe (panel only ever shows today's
+				// bars) so Tick Replay doesn't have to replay weeks/months of ticks on load.
+				string instrumentName = Instrument.FullName;
+				AddDataSeries(instrumentName, new BarsPeriod { BarsPeriodType = BarsPeriodType.Minute, Value = 5 }, 300, null, null);   // BarsArray[1]
+				AddDataSeries(instrumentName, new BarsPeriod { BarsPeriodType = BarsPeriodType.Minute, Value = 15 }, 100, null, null);  // BarsArray[2]
+				AddDataSeries(instrumentName, new BarsPeriod { BarsPeriodType = BarsPeriodType.Minute, Value = 60 }, 30, null, null);   // BarsArray[3]
 			}
 			else if (State == State.Terminated)
 			{
@@ -136,6 +147,12 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				TextAlignment = SharpDX.DirectWrite.TextAlignment.Center,
 				ParagraphAlignment = ParagraphAlignment.Center
 			};
+
+			countdownFormat = new TextFormat(Core.Globals.DirectWriteFactory, "Arial", FontWeight.Normal, FontStyle.Normal, 10f)
+			{
+				TextAlignment = SharpDX.DirectWrite.TextAlignment.Center,
+				ParagraphAlignment = ParagraphAlignment.Center
+			};
 		}
 
 		private Brush ToBrush(System.Windows.Media.Brush mediaBrush)
@@ -157,6 +174,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			currentPriceBrush?.Dispose(); currentPriceBrush = null;
 			dashedStrokeStyle?.Dispose(); dashedStrokeStyle = null;
 			labelFormat?.Dispose(); labelFormat = null;
+			countdownFormat?.Dispose(); countdownFormat = null;
 		}
 
 		protected override void OnRender(ChartControl chartControl, ChartScale chartScale)
@@ -188,10 +206,20 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			RenderTarget.FillRectangle(panelRect, bgBrush);
 			RenderTarget.DrawRectangle(panelRect, borderBrush, 1f);
 
-			const float topPad = 18f;    // room for the "5m/15m/1H" label row
-			const float bottomPad = 8f;
+			float biasPad = ShowBiasLabel ? 16f : 0f;   // room for the overall bias row at the very top
+			float topPad = biasPad + (ShowTimeRemaining ? 22f : 8f);    // room for the countdown row above the bars
+			const float bottomPad = 30f;    // room for the "5m/15m/1H" label row + volume-score row below the bars
 			float candleAreaTop = panelY + topPad;
 			float candleAreaHeight = PanelHeight - topPad - bottomPad;
+
+			if (ShowBiasLabel)
+			{
+				Bias bias = ComputeBias(c5, c15, c1h);
+				var biasBrush = bias == Bias.Bullish ? upBrush : bias == Bias.Bearish ? downBrush : textBrush;
+				string biasText = "BIAS: " + (bias == Bias.Bullish ? "BULLISH" : bias == Bias.Bearish ? "BEARISH" : "MIXED");
+				var biasRect = new RectangleF(panelX, panelY + 2f, PanelWidth, 14f);
+				RenderTarget.DrawText(biasText, labelFormat, biasRect, biasBrush);
+			}
 
 			// 1H group is sized to match the 15m group's width (same slot count) rather than
 			// its own (usually much smaller) candle count.
@@ -210,9 +238,9 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 
 			bool showPrice = ShowCurrentPriceLine && currentPriceBrush != null;
 
-			xCursor = DrawGroup(c5, "5m", xCursor, pitch, slots5m, candleAreaTop, candleAreaHeight, groupGap, showPrice && c5.Count > 0 ? (double?)c5[c5.Count - 1].Close : null);
-			xCursor = DrawGroup(c15, "15m", xCursor, pitch, slots15m, candleAreaTop, candleAreaHeight, groupGap, showPrice && c15.Count > 0 ? (double?)c15[c15.Count - 1].Close : null);
-			xCursor = DrawGroup(c1h, "1H", xCursor, pitch, slots1h, candleAreaTop, candleAreaHeight, groupGap, showPrice && c1h.Count > 0 ? (double?)c1h[c1h.Count - 1].Close : null);
+			xCursor = DrawGroup(c5, "5m", xCursor, pitch, slots5m, candleAreaTop, candleAreaHeight, groupGap, showPrice && c5.Count > 0 ? (double?)c5[c5.Count - 1].Close : null, 5, GroupVolumeScore(c5));
+			xCursor = DrawGroup(c15, "15m", xCursor, pitch, slots15m, candleAreaTop, candleAreaHeight, groupGap, showPrice && c15.Count > 0 ? (double?)c15[c15.Count - 1].Close : null, 15, GroupVolumeScore(c15));
+			xCursor = DrawGroup(c1h, "1H", xCursor, pitch, slots1h, candleAreaTop, candleAreaHeight, groupGap, showPrice && c1h.Count > 0 ? (double?)c1h[c1h.Count - 1].Close : null, 60, GroupVolumeScore(c1h));
 		}
 
 		private SharpDX.Direct2D1.StrokeStyle dashedStrokeStyle;
@@ -234,7 +262,7 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		/// candles it contains are spread evenly across that width.
 		/// </summary>
 		private float DrawGroup(List<Candle> candles, string label, float xStart, float pitch, int slots,
-			float areaTop, float areaHeight, float groupGap, double? currentPrice)
+			float areaTop, float areaHeight, float groupGap, double? currentPrice, int periodMinutes, double volumeScore)
 		{
 			if (candles.Count == 0)
 				return xStart; // nothing drawn, no gap to add
@@ -255,9 +283,21 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			float groupWidth = pitch * slots;
 			float candlePitch = groupWidth / candles.Count;
 
-			// group label centered above this group's slots
-			var labelRect = new RectangleF(xStart, areaTop - 16f, groupWidth, 14f);
+			// countdown to this timeframe's current bar close, centered above the bars
+			if (ShowTimeRemaining)
+			{
+				var countdownRect = new RectangleF(xStart, areaTop - 16f, groupWidth, 14f);
+				RenderTarget.DrawText(FormatTimeRemaining(periodMinutes), countdownFormat, countdownRect, textBrush);
+			}
+
+			// group label centered below this group's slots
+			var labelRect = new RectangleF(xStart, areaTop + areaHeight + 2f, groupWidth, 14f);
 			RenderTarget.DrawText(label, labelFormat, labelRect, textBrush);
+
+			// volume-weighted direction score below the label, colored by sign (drives the overall bias vote)
+			var scoreBrush = volumeScore > 0 ? upBrush : volumeScore < 0 ? downBrush : textBrush;
+			var scoreRect = new RectangleF(xStart, areaTop + areaHeight + 16f, groupWidth, 12f);
+			RenderTarget.DrawText(FormatVolumeScore(volumeScore), countdownFormat, scoreRect, scoreBrush);
 
 			// faint outline box around the group so its candles read as one cluster
 			const float boxPad = 4f;
@@ -307,6 +347,70 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 			return xStart + groupWidth + groupGap;
 		}
 
+		/// <summary>
+		/// Time remaining until the current bar of a fixed-period (period-minutes) series closes,
+		/// assuming standard bars aligned to clock boundaries from midnight.
+		/// </summary>
+		private static string FormatTimeRemaining(int periodMinutes)
+		{
+			DateTime now = Core.Globals.Now;
+			double elapsedMinutes = (now - now.Date).TotalMinutes;
+			double nextBoundaryMinutes = Math.Ceiling(elapsedMinutes / periodMinutes) * periodMinutes;
+			DateTime nextClose = now.Date.AddMinutes(nextBoundaryMinutes);
+			TimeSpan remaining = nextClose - now;
+			if (remaining < TimeSpan.Zero)
+				remaining = TimeSpan.Zero;
+
+			int totalSeconds = (int)remaining.TotalSeconds;
+			return string.Format("{0}:{1:00}", totalSeconds / 60, totalSeconds % 60);
+		}
+
+		/// <summary>
+		/// Volume-weighted direction score for one timeframe group:
+		/// sum of each candle's volume, signed by that candle's up/down direction.
+		/// Positive = net buying volume, negative = net selling volume.
+		/// </summary>
+		private static double GroupVolumeScore(List<Candle> candles)
+		{
+			double score = 0;
+			foreach (var c in candles)
+				score += c.Volume * (c.Close >= c.Open ? 1 : -1);
+			return score;
+		}
+
+		/// <summary>
+		/// Formats a volume score as a signed, abbreviated number, e.g. +12.3K, -4.5M, +0.
+		/// </summary>
+		private static string FormatVolumeScore(double score)
+		{
+			double abs = Math.Abs(score);
+			string magnitude = abs >= 1_000_000 ? (abs / 1_000_000).ToString("0.0") + "M"
+				: abs >= 1_000 ? (abs / 1_000).ToString("0.0") + "K"
+				: abs.ToString("0");
+			return (score > 0 ? "+" : score < 0 ? "-" : "") + magnitude;
+		}
+
+		/// <summary>
+		/// Overall bias from majority vote of the three timeframe groups' volume-weighted
+		/// direction scores. Empty groups don't get a vote. Ties/no-data fall back to Mixed.
+		/// </summary>
+		private static Bias ComputeBias(List<Candle> c5, List<Candle> c15, List<Candle> c1h)
+		{
+			int bullish = 0, bearish = 0;
+			foreach (var group in new[] { c5, c15, c1h })
+			{
+				if (group.Count == 0)
+					continue;
+				double score = GroupVolumeScore(group);
+				if (score > 0) bullish++;
+				else if (score < 0) bearish++;
+			}
+
+			if (bullish > bearish) return Bias.Bullish;
+			if (bearish > bullish) return Bias.Bearish;
+			return Bias.Mixed;
+		}
+
 		private static float PriceToY(double price, double minLow, double maxHigh, float areaTop, float areaHeight)
 		{
 			double range = maxHigh - minLow;
@@ -317,6 +421,8 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		/// <summary>
 		/// Reads the last <paramref name="count"/> closed bars (oldest first) from the
 		/// given BarsArray index, e.g. index 1 = the 5-minute series added in Configure.
+		/// Stops walking backward as soon as a bar from a prior day is hit, so the panel
+		/// never shows candles from before today's session.
 		/// </summary>
 		private List<Candle> CollectCandles(int seriesIndex, int count)
 		{
@@ -325,10 +431,24 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 				return list;
 
 			int lastIdx = CurrentBars[seriesIndex];
-			int available = Math.Min(count, lastIdx + 1);
 			var bars = BarsArray[seriesIndex];
-			for (int absIdx = lastIdx - available + 1; absIdx <= lastIdx; absIdx++)
+			DateTime today = Core.Globals.Now.Date;
+
+			for (int absIdx = lastIdx; absIdx >= 0 && list.Count < count; absIdx--)
 			{
+				DateTime barTime;
+				try
+				{
+					barTime = bars.GetTime(absIdx);
+				}
+				catch (Exception)
+				{
+					break; // bar not yet materialized at this absolute index
+				}
+
+				if (barTime.Date != today)
+					break; // walked back into a prior session
+
 				try
 				{
 					list.Add(new Candle
@@ -337,14 +457,17 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 						High = bars.GetHigh(absIdx),
 						Low = bars.GetLow(absIdx),
 						Close = bars.GetClose(absIdx),
-						Time = bars.GetTime(absIdx)
+						Volume = bars.GetVolume(absIdx),
+						Time = barTime
 					});
 				}
 				catch (Exception)
 				{
-					// Bar not yet materialized at this absolute index; skip it.
+					break;
 				}
 			}
+
+			list.Reverse(); // oldest first
 			return list;
 		}
 
@@ -443,6 +566,14 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		[Display(Name = "Show current price line", GroupName = "Parameters", Order = 6)]
 		public bool ShowCurrentPriceLine { get; set; }
 
+		[NinjaScriptProperty]
+		[Display(Name = "Show time remaining", GroupName = "Parameters", Order = 7)]
+		public bool ShowTimeRemaining { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Show bias label", GroupName = "Parameters", Order = 8)]
+		public bool ShowBiasLabel { get; set; }
+
 		[XmlIgnore]
 		[Display(Name = "Text color", GroupName = "Colors", Order = 6)]
 		public System.Windows.Media.Brush TextColorBrush { get; set; }
@@ -466,60 +597,3 @@ namespace NinjaTrader.NinjaScript.Indicators.ItCodeNerd
 		#endregion
 	}
 }
-
-#region NinjaScript generated code. Neither change nor remove.
-
-namespace NinjaTrader.NinjaScript.Indicators
-{
-	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
-	{
-		private ItCodeNerd.ICNCandlePanel[] cacheICNCandlePanel;
-		public ItCodeNerd.ICNCandlePanel ICNCandlePanel(int candles5m, int candles15m, int candles1h, float panelWidth, float panelHeight, PanelCorner panelCorner, float panelMarginRight, float panelMarginLeft, float panelMarginTop, float panelMarginBottom, bool showCurrentPriceLine)
-		{
-			return ICNCandlePanel(Input, candles5m, candles15m, candles1h, panelWidth, panelHeight, panelCorner, panelMarginRight, panelMarginLeft, panelMarginTop, panelMarginBottom, showCurrentPriceLine);
-		}
-
-		public ItCodeNerd.ICNCandlePanel ICNCandlePanel(ISeries<double> input, int candles5m, int candles15m, int candles1h, float panelWidth, float panelHeight, PanelCorner panelCorner, float panelMarginRight, float panelMarginLeft, float panelMarginTop, float panelMarginBottom, bool showCurrentPriceLine)
-		{
-			if (cacheICNCandlePanel != null)
-				for (int idx = 0; idx < cacheICNCandlePanel.Length; idx++)
-					if (cacheICNCandlePanel[idx] != null && cacheICNCandlePanel[idx].Candles5m == candles5m && cacheICNCandlePanel[idx].Candles15m == candles15m && cacheICNCandlePanel[idx].Candles1h == candles1h && cacheICNCandlePanel[idx].PanelWidth == panelWidth && cacheICNCandlePanel[idx].PanelHeight == panelHeight && cacheICNCandlePanel[idx].PanelCorner == panelCorner && cacheICNCandlePanel[idx].PanelMarginRight == panelMarginRight && cacheICNCandlePanel[idx].PanelMarginLeft == panelMarginLeft && cacheICNCandlePanel[idx].PanelMarginTop == panelMarginTop && cacheICNCandlePanel[idx].PanelMarginBottom == panelMarginBottom && cacheICNCandlePanel[idx].ShowCurrentPriceLine == showCurrentPriceLine && cacheICNCandlePanel[idx].EqualsInput(input))
-						return cacheICNCandlePanel[idx];
-			return CacheIndicator<ItCodeNerd.ICNCandlePanel>(new ItCodeNerd.ICNCandlePanel(){ Candles5m = candles5m, Candles15m = candles15m, Candles1h = candles1h, PanelWidth = panelWidth, PanelHeight = panelHeight, PanelCorner = panelCorner, PanelMarginRight = panelMarginRight, PanelMarginLeft = panelMarginLeft, PanelMarginTop = panelMarginTop, PanelMarginBottom = panelMarginBottom, ShowCurrentPriceLine = showCurrentPriceLine }, input, ref cacheICNCandlePanel);
-		}
-	}
-}
-
-namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
-{
-	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
-	{
-		public Indicators.ItCodeNerd.ICNCandlePanel ICNCandlePanel(int candles5m, int candles15m, int candles1h, float panelWidth, float panelHeight, PanelCorner panelCorner, float panelMarginRight, float panelMarginLeft, float panelMarginTop, float panelMarginBottom, bool showCurrentPriceLine)
-		{
-			return indicator.ICNCandlePanel(Input, candles5m, candles15m, candles1h, panelWidth, panelHeight, panelCorner, panelMarginRight, panelMarginLeft, panelMarginTop, panelMarginBottom, showCurrentPriceLine);
-		}
-
-		public Indicators.ItCodeNerd.ICNCandlePanel ICNCandlePanel(ISeries<double> input , int candles5m, int candles15m, int candles1h, float panelWidth, float panelHeight, PanelCorner panelCorner, float panelMarginRight, float panelMarginLeft, float panelMarginTop, float panelMarginBottom, bool showCurrentPriceLine)
-		{
-			return indicator.ICNCandlePanel(input, candles5m, candles15m, candles1h, panelWidth, panelHeight, panelCorner, panelMarginRight, panelMarginLeft, panelMarginTop, panelMarginBottom, showCurrentPriceLine);
-		}
-	}
-}
-
-namespace NinjaTrader.NinjaScript.Strategies
-{
-	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
-	{
-		public Indicators.ItCodeNerd.ICNCandlePanel ICNCandlePanel(int candles5m, int candles15m, int candles1h, float panelWidth, float panelHeight, PanelCorner panelCorner, float panelMarginRight, float panelMarginLeft, float panelMarginTop, float panelMarginBottom, bool showCurrentPriceLine)
-		{
-			return indicator.ICNCandlePanel(Input, candles5m, candles15m, candles1h, panelWidth, panelHeight, panelCorner, panelMarginRight, panelMarginLeft, panelMarginTop, panelMarginBottom, showCurrentPriceLine);
-		}
-
-		public Indicators.ItCodeNerd.ICNCandlePanel ICNCandlePanel(ISeries<double> input , int candles5m, int candles15m, int candles1h, float panelWidth, float panelHeight, PanelCorner panelCorner, float panelMarginRight, float panelMarginLeft, float panelMarginTop, float panelMarginBottom, bool showCurrentPriceLine)
-		{
-			return indicator.ICNCandlePanel(input, candles5m, candles15m, candles1h, panelWidth, panelHeight, panelCorner, panelMarginRight, panelMarginLeft, panelMarginTop, panelMarginBottom, showCurrentPriceLine);
-		}
-	}
-}
-
-#endregion
