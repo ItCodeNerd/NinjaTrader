@@ -11,6 +11,10 @@ Custom NinjaTrader indicators.
 - [**Important Lines**](Indicators/ImportantLines) — combined indicator plotting VWAPs, previous-day/week levels, initial balance, opening range, session highs/lows, fixed price lines, and EMAs on one chart.
 - [**Order Panel**](Indicators/OrderPanel) — custom order entry panel indicator with mark buy/sell buttons and locked/enabled input state feedback.
 
+## AddOns
+
+- [**Tick Stream Server**](Indicators/TickStreamer) — relays live tick data over TCP (newline-delimited JSON), with push/pull historical bar requests, configurable from a Control Center menu entry.
+
 ## License
 
 MIT
