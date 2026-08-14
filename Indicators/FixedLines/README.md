@@ -2,6 +2,10 @@
 
 Lightweight overlay: fixed-interval price grid, session/day-high/day-low anchored VWAPs, and 9/50/200 EMA. Plots only, no custom bar rendering, kept lean for performance.
 
+<img width="734" height="539" alt="Screenshot_2" src="https://github.com/user-attachments/assets/f59b038d-ad8c-4517-9cf8-c135accc2515" />
+<img width="303" height="505" alt="Screenshot_1" src="https://github.com/user-attachments/assets/72e0bf4b-ae3b-4292-930b-355298420a5a" />
+
+
 ## Lines available
 
 - **Fixed Lines** — horizontal grid at a fixed price step (default 100), spanning a configurable number of levels above/below current price. Bounds recompute only when price nears the edge of the current range or step changes, avoiding per-bar redraw.

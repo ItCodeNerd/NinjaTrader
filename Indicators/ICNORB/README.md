@@ -2,6 +2,8 @@
 
 Standalone Opening-Range-Breakout indicator, extracted from ICNImportantLines' ORB feature set. Draws NY/Asia/Europe opening-range high & low lines plus NY/London pre-open boxes. History of past sessions' boxes kept (bounded to 250 days) and drawn alongside the live one.
 
+<img width="734" height="507" alt="Screenshot_3" src="https://github.com/user-attachments/assets/9ab9ca12-3dda-4dd6-8ef4-57a9a8703367" />
+
 ## Lines available
 
 - **NY / Asia / Europe ORB** — high and low made in the first N minutes after each session's open (NYStartTime, AsiaStartTime, EuropeStartTime). Line runs from the ORB window's start bar; extends to the live edge while still forming, freezes at session end once the window closes. Each session independently toggleable, colored, sized.
