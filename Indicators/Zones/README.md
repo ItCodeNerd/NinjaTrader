@@ -2,6 +2,8 @@
 
 Automates hand-drawn horizontal "manual box" levels. Four independent detectors feed one shared zone list; overlapping zones from different detectors optionally merge into a single confluence zone whose opacity scales with how many detectors agree.
 
+<img width="693" height="742" alt="image" src="https://github.com/user-attachments/assets/fab22b17-a973-4e32-864b-224b3f56a51a" />
+
 ## Detectors
 
 - **Displacement candle anatomy** — candle whose body (or full range) exceeds `Displacement ATR Multiple` x ATR(`ATR Period`) counts as displacement. Emits thin bands: wick high, wick low, body top, body bottom, body CE (midpoint) and range CE.
